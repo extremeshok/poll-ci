@@ -15,9 +15,10 @@ in one sitting.
                                             docker run <your image>: ci/test ✓  ci/lint ✗
 ```
 
+![release](https://img.shields.io/github/v/release/extremeshok/poll-ci)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![go](https://img.shields.io/badge/go-1.26-00ADD8)
-![deps](https://img.shields.io/badge/dependencies-1-brightgreen)
+![image](https://img.shields.io/badge/ghcr.io-poll--ci-blue?logo=docker&logoColor=white)
 ![ports](https://img.shields.io/badge/inbound%20ports-none-success)
 
 ---
@@ -376,6 +377,19 @@ docker run --rm \
 
 ## Deploying
 
+### Container images
+
+Prebuilt, multi-arch (`linux/amd64` + `linux/arm64`) images are published to the
+GitHub Container Registry:
+
+```
+ghcr.io/extremeshok/poll-ci:latest    # newest release
+ghcr.io/extremeshok/poll-ci:v1.0.0    # pin to a specific version (recommended for prod)
+```
+
+Prefer building your own? `docker build -t poll-ci .` from a checkout — the
+[`Dockerfile`](Dockerfile) is a small multi-stage build (binary + git + Docker CLI).
+
 ### docker run
 
 The [Quickstart](#quickstart-60-seconds) command, with `--restart always`, is a
@@ -389,18 +403,25 @@ Use the included [`docker-compose.yml`](docker-compose.yml):
 ```bash
 export GITHUB_TOKEN=github_pat_xxx
 cp repos.example.yml repos.yml      # then edit it
-docker compose up -d --build
+docker compose up -d               # pulls ghcr.io/extremeshok/poll-ci
 ```
 
 ### As a plain binary (systemd)
 
 poll-ci is a single binary; it shells out to `git` and `docker`, both of which
-must be on `PATH` (and the user must be able to run `docker`). Build and install
-it directly if you'd rather not containerize the engine:
+must be on `PATH` (and the user must be able to run `docker`). Install it
+directly if you'd rather not containerize the engine — grab a prebuilt binary
+from the [releases page](https://github.com/extremeshok/poll-ci/releases), or
+`go install`:
 
 ```bash
-git clone https://github.com/extremeshok/poll-ci && cd poll-ci
-go build -o poll-ci . && sudo install poll-ci /usr/local/bin/
+# Prebuilt (Linux x86-64; see releases for other OS/arch + newer versions).
+# The tarball also contains README.md + LICENSE.
+curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.0.0/poll-ci_v1.0.0_linux_amd64.tar.gz | tar -xz
+sudo install poll-ci /usr/local/bin/
+
+# …or from source:
+go install github.com/extremeshok/poll-ci@latest   # to $(go env GOPATH)/bin
 ```
 
 ```ini
@@ -431,8 +452,9 @@ journalctl -u poll-ci -f
 ### Updating
 
 ```bash
-cd poll-ci && git pull
-docker compose up -d --build      # or: docker build -t poll-ci . && docker rm -f poll-ci && docker run ...
+docker compose pull && docker compose up -d   # pull the newest image and recreate
+# not using compose?  docker pull ghcr.io/extremeshok/poll-ci && \
+#   docker rm -f poll-ci && docker run …   (the run command from the quickstart)
 ```
 
 State on the volume is preserved, so already-tested commits aren't re-run.
