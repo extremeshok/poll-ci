@@ -8,9 +8,9 @@
 
 services:
   poll-ci:
-    build: .
-    # Or use a prebuilt image instead of `build: .`:
-    # image: ghcr.io/extremeshok/poll-ci:latest
+    image: ghcr.io/extremeshok/poll-ci:latest
+    # Or build the engine image locally instead of pulling:
+    # build: .
     restart: always
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:?set GITHUB_TOKEN in your environment}

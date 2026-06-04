@@ -120,9 +120,9 @@ protection, shown in the PR merge box, and visible via the API.
 You need Docker, a GitHub repo, and a token (see [Token setup](#token-setup)).
 
 ```bash
-# 1. Build the engine image (the binary + git + the Docker CLI)
-git clone https://github.com/extremeshok/poll-ci && cd poll-ci
-docker build -t poll-ci .
+# 1. Get the engine image — pull the prebuilt multi-arch image:
+docker pull ghcr.io/extremeshok/poll-ci:latest
+#    (or build it yourself: git clone the repo and `docker build -t poll-ci .`)
 
 # 2. Add a .poll-ci.yml to the repo you want to test (commit & push it):
 cat > .poll-ci.yml <<'YML'
@@ -139,14 +139,16 @@ docker run -d --name poll-ci --restart always \
   -e BRANCH=main \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v poll-ci-state:/var/lib/poll-ci \
-  poll-ci
+  ghcr.io/extremeshok/poll-ci:latest
 ```
 
 Push to that branch and, within `POLL_INTERVAL` (default 60s), the `ci/*`
 statuses appear on the commit — `pending` first, then `success`/`failure` —
 plus the overall `ci` rollup.
 
-Follow along with `docker logs -f poll-ci`.
+Follow along with `docker logs -f poll-ci`. (Later examples write `poll-ci` as
+the image name for brevity — that's the same image: the prebuilt
+`ghcr.io/extremeshok/poll-ci:latest`, or your local `docker build -t poll-ci .`)
 
 > **The two volumes.** The Docker socket lets poll-ci start your check
 > containers (see [Security](#security)). The `poll-ci-state` volume persists
