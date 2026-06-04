@@ -1,0 +1,217 @@
+package main
+
+// config.go — all configuration: the runner's environment config, the optional
+// multi-repo list (repos.yml), and the per-repo .poll-ci.yml that lives in each
+// watched repository. Deliberately flat: no stages, no matrices, no plugins.
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Ref is a single watched target: a repository and a branch.
+type Ref struct {
+	Owner  string
+	Name   string
+	Branch string
+}
+
+// Repo returns "owner/name".
+func (r Ref) Repo() string { return r.Owner + "/" + r.Name }
+
+// String returns "owner/name@branch" for logging.
+func (r Ref) String() string { return r.Repo() + "@" + r.Branch }
+
+// RunnerConfig is the engine configuration, read entirely from the environment.
+type RunnerConfig struct {
+	Token          string        // GITHUB_TOKEN (required)
+	APIBase        string        // GITHUB_API (default https://api.github.com)
+	GitHost        string        // GIT_HOST  (default github.com)
+	Refs           []Ref         // from REPO+BRANCH or REPOS_FILE
+	PollInterval   time.Duration // POLL_INTERVAL seconds (default 60)
+	WorkDir        string        // WORK_DIR (scratch clones + state)
+	StateFile      string        // STATE_FILE (default WORK_DIR/state.json)
+	DefaultImage   string        // DEFAULT_IMAGE for repos that omit image:
+	DefaultTimeout time.Duration // DEFAULT_TIMEOUT seconds per check (default 1800)
+	DockerBin      string        // DOCKER_BIN (default "docker")
+	PollPRs        bool          // POLL_PRS — also test same-repo open PR heads
+}
+
+// RepoConfig is a repository's .poll-ci.yml.
+type RepoConfig struct {
+	Image  string  `yaml:"image"`
+	Checks []Check `yaml:"checks"`
+}
+
+// Check is one named command to run.
+type Check struct {
+	Name    string `yaml:"name"`
+	Run     string `yaml:"run"`
+	Timeout int    `yaml:"timeout"` // seconds; 0 → DefaultTimeout
+}
+
+// LoadRunnerConfig builds the engine configuration from environment variables.
+func LoadRunnerConfig() (*RunnerConfig, error) {
+	c := &RunnerConfig{
+		Token:          os.Getenv("GITHUB_TOKEN"),
+		APIBase:        envOr("GITHUB_API", "https://api.github.com"),
+		GitHost:        envOr("GIT_HOST", "github.com"),
+		WorkDir:        os.Getenv("WORK_DIR"),
+		StateFile:      os.Getenv("STATE_FILE"),
+		DefaultImage:   envOr("DEFAULT_IMAGE", "alpine:latest"),
+		DockerBin:      envOr("DOCKER_BIN", "docker"),
+		PollPRs:        truthy(os.Getenv("POLL_PRS")),
+		PollInterval:   secondsOr("POLL_INTERVAL", 60),
+		DefaultTimeout: secondsOr("DEFAULT_TIMEOUT", 1800),
+	}
+	if c.Token == "" {
+		return nil, fmt.Errorf("GITHUB_TOKEN is required")
+	}
+	c.APIBase = strings.TrimRight(c.APIBase, "/")
+
+	// Resolve a writable work directory: explicit WORK_DIR, else /var/lib/poll-ci,
+	// else a temp dir (handy when running the binary directly on a dev machine).
+	if c.WorkDir == "" {
+		for _, cand := range []string{"/var/lib/poll-ci", os.TempDir() + "/poll-ci"} {
+			if os.MkdirAll(cand, 0o755) == nil {
+				c.WorkDir = cand
+				break
+			}
+		}
+		if c.WorkDir == "" {
+			return nil, fmt.Errorf("could not create a work directory; set WORK_DIR")
+		}
+	} else if err := os.MkdirAll(c.WorkDir, 0o755); err != nil {
+		return nil, fmt.Errorf("WORK_DIR %q: %w", c.WorkDir, err)
+	}
+	if c.StateFile == "" {
+		c.StateFile = c.WorkDir + "/state.json"
+	}
+
+	// Targets: either a single REPO+BRANCH, or a REPOS_FILE listing several.
+	refs, err := loadRefs()
+	if err != nil {
+		return nil, err
+	}
+	c.Refs = refs
+	return c, nil
+}
+
+// loadRefs reads REPO/BRANCH or REPOS_FILE into a list of Refs.
+func loadRefs() ([]Ref, error) {
+	if path := os.Getenv("REPOS_FILE"); path != "" {
+		return loadReposFile(path)
+	}
+	repo := os.Getenv("REPO")
+	if repo == "" {
+		return nil, fmt.Errorf("set REPO=owner/name (and optional BRANCH) or REPOS_FILE=/path/to/repos.yml")
+	}
+	ref, err := parseRef(repo, envOr("BRANCH", "main"))
+	if err != nil {
+		return nil, err
+	}
+	return []Ref{ref}, nil
+}
+
+// loadReposFile parses a repos.yml of the form:
+//
+//	repos:
+//	  - repo: owner/name
+//	    branch: main
+func loadReposFile(path string) ([]Ref, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read REPOS_FILE: %w", err)
+	}
+	var f struct {
+		Repos []struct {
+			Repo   string `yaml:"repo"`
+			Branch string `yaml:"branch"`
+		} `yaml:"repos"`
+	}
+	if err := yaml.Unmarshal(data, &f); err != nil {
+		return nil, fmt.Errorf("parse REPOS_FILE: %w", err)
+	}
+	if len(f.Repos) == 0 {
+		return nil, fmt.Errorf("REPOS_FILE %q lists no repos", path)
+	}
+	var refs []Ref
+	for _, r := range f.Repos {
+		branch := r.Branch
+		if branch == "" {
+			branch = "main"
+		}
+		ref, err := parseRef(r.Repo, branch)
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	return refs, nil
+}
+
+// parseRepoConfig parses a .poll-ci.yml byte slice and validates it.
+func parseRepoConfig(data []byte) (*RepoConfig, error) {
+	var rc RepoConfig
+	if err := yaml.Unmarshal(data, &rc); err != nil {
+		return nil, fmt.Errorf("invalid .poll-ci.yml: %w", err)
+	}
+	if len(rc.Checks) == 0 {
+		return nil, fmt.Errorf(".poll-ci.yml defines no checks")
+	}
+	seen := map[string]bool{}
+	for i, ck := range rc.Checks {
+		if ck.Name == "" {
+			return nil, fmt.Errorf("check #%d has no name", i+1)
+		}
+		if ck.Run == "" {
+			return nil, fmt.Errorf("check %q has no run command", ck.Name)
+		}
+		if seen[ck.Name] {
+			return nil, fmt.Errorf("duplicate check name %q", ck.Name)
+		}
+		seen[ck.Name] = true
+	}
+	return &rc, nil
+}
+
+// parseRef turns "owner/name" + branch into a Ref.
+func parseRef(repo, branch string) (Ref, error) {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return Ref{}, fmt.Errorf("repo %q must be in the form owner/name", repo)
+	}
+	if branch == "" {
+		branch = "main"
+	}
+	return Ref{Owner: parts[0], Name: parts[1], Branch: branch}, nil
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func secondsOr(key string, def int) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return time.Duration(def) * time.Second
+}
+
+func truthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}

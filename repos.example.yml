@@ -1,0 +1,10 @@
+# Repositories to watch. Copy to repos.yml and point REPOS_FILE at it.
+# Each entry is just a repo and a branch — no per-repo runner settings here;
+# the checks themselves live in each repo's .poll-ci.yml.
+repos:
+  - repo: your-org/api
+    branch: main
+  - repo: your-org/web
+    branch: develop
+  - repo: your-name/side-project
+    branch: main

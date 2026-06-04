@@ -1,0 +1,26 @@
+# Watch several repositories with one poll-ci container.
+#
+#   export GITHUB_TOKEN=github_pat_xxx
+#   cp repos.example.yml repos.yml   # then edit it
+#   docker compose up -d --build
+#
+# See README.md for the security implications of mounting the Docker socket.
+
+services:
+  poll-ci:
+    build: .
+    # Or use a prebuilt image instead of `build: .`:
+    # image: ghcr.io/extremeshok/poll-ci:latest
+    restart: always
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN:?set GITHUB_TOKEN in your environment}
+      REPOS_FILE: /config/repos.yml
+      POLL_INTERVAL: "60"
+      # POLL_PRS: "true"   # also test same-repo open PR heads (see README)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./repos.yml:/config/repos.yml:ro
+      - pollci-state:/var/lib/poll-ci
+
+volumes:
+  pollci-state:

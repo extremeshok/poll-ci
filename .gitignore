@@ -1,0 +1,7 @@
+# build output
+/poll-ci
+/dist/
+
+# local state / scratch
+state.json
+*.tmp

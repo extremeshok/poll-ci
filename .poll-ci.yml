@@ -1,0 +1,10 @@
+# poll-ci dogfoods itself: these are the checks poll-ci runs on its own commits.
+image: golang:1.26
+checks:
+  - name: build
+    run: go build ./...
+  - name: vet
+    run: go vet ./...
+  - name: test
+    run: go test ./...
+    timeout: 300

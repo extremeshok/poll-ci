@@ -1,0 +1,10 @@
+.git
+.gitignore
+*.md
+docs
+examples
+docker-compose.yml
+repos.example.yml
+LICENSE
+dist
+poll-ci

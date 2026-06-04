@@ -1,0 +1,11 @@
+# Example .poll-ci.yml for a Node project. Drop this at your repo root.
+#
+# Each check runs in its own fresh container (no shared workspace between
+# checks), so every check that needs node_modules installs them itself.
+image: node:22
+checks:
+  - name: test
+    run: npm ci && npm test
+    timeout: 600
+  - name: lint
+    run: npm ci && npm run lint --if-present

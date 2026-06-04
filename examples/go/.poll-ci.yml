@@ -1,0 +1,10 @@
+# Example .poll-ci.yml for a Go project. Drop this at your repo root.
+image: golang:1.26
+checks:
+  - name: build
+    run: go build ./...
+  - name: vet
+    run: go vet ./...
+  - name: test
+    run: go test ./...
+    timeout: 600

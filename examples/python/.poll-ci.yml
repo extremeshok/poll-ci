@@ -1,0 +1,11 @@
+# Example .poll-ci.yml for a Python project. Drop this at your repo root.
+#
+# Each check runs in its own fresh container (no shared workspace between
+# checks), so every check that needs dependencies installs them itself.
+image: python:3.12
+checks:
+  - name: test
+    run: pip install --no-cache-dir -r requirements.txt && pytest -q
+    timeout: 600
+  - name: lint
+    run: pip install --no-cache-dir ruff && ruff check .
