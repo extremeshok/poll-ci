@@ -263,6 +263,33 @@ checks:
   poll-ci; it's handed verbatim to `sh -ec` in the container, so normal shell
   (`&&`, `|`, `$(...)`, env vars) works.
 
+### Promoting a deploy branch on green (`promote:`)
+
+Optionally, when **every check passes on a watched branch**, poll-ci can
+fast-forward another branch to the tested commit. This turns "green on `master`"
+into "`release` updated", so a deploy poller on your server can ship it — a
+fully poll-based, GitHub-Actions-free CD pipeline:
+
+```yaml
+image: golang:1.26
+checks:
+  - name: test
+    run: go test ./...
+promote:
+  branch: release         # on green of the watched branch, fast-forward this branch
+```
+
+- Runs **only for branch commits** — never for PR heads (`POLL_PRS`) or `--once`.
+- The update is **fast-forward only** (GitHub rejects a non-fast-forward), so a
+  `release` someone moved by hand is never clobbered — poll-ci reports the
+  refusal instead. If the target branch doesn't exist yet, it's created.
+- The outcome is its own commit status, **`ci/promote`** (`success` / `error`),
+  alongside the per-check statuses.
+- This needs the token to have **`Contents: write`** (status reporting alone only
+  needs `Commit statuses: write` + `Contents: read`). Promotion is opt-in, so the
+  extra scope is required only when a repo asks for it; a token without it yields
+  a clear `ci/promote` failure rather than a silent no-op.
+
 ---
 
 ## Example configs
@@ -459,6 +486,20 @@ docker compose pull && docker compose up -d   # pull the newest image and recrea
 
 State on the volume is preserved, so already-tested commits aren't re-run.
 
+**Automatic updates (optional).** The bundled compose file ships a profile that
+keeps poll-ci on the latest image for you, via [watchtower]:
+
+```bash
+docker compose --profile autoupdate up -d
+```
+
+Watchtower polls the registry hourly and recreates the poll-ci container in place
+when its image digest changes (scoped by label to only touch poll-ci). A new
+image landing mid-check is safe: poll-ci catches SIGTERM, cancels the in-flight
+check, and re-runs that commit after the restart.
+
+[watchtower]: https://containrrr.dev/watchtower/
+
 ---
 
 ## Token setup
@@ -472,7 +513,8 @@ token*:
 
 1. **Repository access** → select the repos you want to watch.
 2. **Permissions → Repository permissions**:
-   - **Contents: Read-only**  (read the branch HEAD and clone)
+   - **Contents: Read-only**  (read the branch HEAD and clone) — bump to
+     **Read and write** only if you use `promote:` (to fast-forward the deploy branch)
    - **Commit statuses: Read and write**  (post results)
 3. Generate, copy, and pass it as `GITHUB_TOKEN`.
 

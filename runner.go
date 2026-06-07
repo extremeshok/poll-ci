@@ -74,9 +74,12 @@ func (r *Runner) processBranch(ctx context.Context, ref Ref) error {
 	if r.store.Has(ref, sha) {
 		return r.store.Mark(ref, tip)
 	}
-	r.runCommit(ctx, ref, sha, dir)
+	passed := r.runCommit(ctx, ref, sha, dir)
 	if ctx.Err() != nil {
 		return nil // interrupted by shutdown — leave unmarked so it retries on restart
+	}
+	if passed {
+		r.maybePromote(ctx, ref, sha, dir)
 	}
 	return r.store.Mark(ref, tip, sha)
 }
@@ -170,6 +173,50 @@ func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) bool {
 	}
 	r.setStatus(ctx, ref, sha, StateFailure, "ci", fmt.Sprintf("%d of %d checks failed", failed, len(rc.Checks)))
 	return false
+}
+
+// maybePromote fast-forwards the repo's configured promote.branch to the tested
+// commit. It runs only for branch runs that passed every check — never for PRs
+// or --once. A failure is reported as a ci/promote commit status and logged, but
+// does not block marking the commit processed: the operator fixes the cause
+// (usually a token lacking Contents:write, or a diverged target) and the next
+// green commit promotes.
+func (r *Runner) maybePromote(ctx context.Context, ref Ref, sha, dir string) {
+	rc, err := r.readRepoConfig(dir)
+	if err != nil || rc.Promote == nil {
+		return
+	}
+	target := strings.TrimSpace(rc.Promote.Branch)
+	if target == "" {
+		return
+	}
+	if target == ref.Branch {
+		log.Printf("[%s] %s: promote.branch is the watched branch; skipping", ref, short(sha))
+		return
+	}
+
+	r.setStatus(ctx, ref, sha, StatePending, "ci/promote", "promoting to "+target)
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if ctx.Err() != nil {
+			return // shutting down — leave the target as-is; re-runs on restart
+		}
+		// Detached timeout so an in-flight ref update still completes on shutdown.
+		pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		err := r.gh.FastForwardRef(pctx, ref, target, sha)
+		cancel()
+		if err == nil {
+			log.Printf("[%s] promoted %s → %s", ref, short(sha), target)
+			r.setStatus(ctx, ref, sha, StateSuccess, "ci/promote", "fast-forwarded "+target+" to "+short(sha))
+			return
+		}
+		lastErr = err
+		if attempt < 3 {
+			time.Sleep(2 * time.Second)
+		}
+	}
+	log.Printf("[%s] %s: promote to %s failed: %v", ref, short(sha), target, lastErr)
+	r.setStatus(ctx, ref, sha, StateError, "ci/promote", "fast-forward "+target+" failed: "+oneLine(lastErr.Error()))
 }
 
 // runCheck runs one check in a fresh container built from `image`, with the

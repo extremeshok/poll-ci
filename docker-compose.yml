@@ -21,6 +21,24 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./repos.yml:/config/repos.yml:ro
       - pollci-state:/var/lib/poll-ci
+    labels:
+      # Lets the optional watchtower service (below) auto-update this container.
+      com.centurylinklabs.watchtower.enable: "true"
+
+  # Optional self-update: keep poll-ci on the latest published image.
+  # Enable with:  docker compose --profile autoupdate up -d
+  # Watchtower polls the registry and, when poll-ci's image digest changes, pulls
+  # it and recreates the container in place. poll-ci handles SIGTERM gracefully,
+  # so an in-flight check is cancelled and simply re-runs after the restart.
+  watchtower:
+    image: containrrr/watchtower:latest
+    profiles: ["autoupdate"]
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # --label-enable scopes updates to containers that opted in via the label
+    # above, so watchtower only touches poll-ci — not every container on the host.
+    command: --cleanup --label-enable --interval 3600
 
 volumes:
   pollci-state:

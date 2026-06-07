@@ -44,8 +44,9 @@ type RunnerConfig struct {
 
 // RepoConfig is a repository's .poll-ci.yml.
 type RepoConfig struct {
-	Image  string  `yaml:"image"`
-	Checks []Check `yaml:"checks"`
+	Image   string   `yaml:"image"`
+	Checks  []Check  `yaml:"checks"`
+	Promote *Promote `yaml:"promote"`
 }
 
 // Check is one named command to run.
@@ -53,6 +54,18 @@ type Check struct {
 	Name    string `yaml:"name"`
 	Run     string `yaml:"run"`
 	Timeout int    `yaml:"timeout"` // seconds; 0 → DefaultTimeout
+}
+
+// Promote optionally fast-forwards a target branch to the tested commit when
+// every check passes on a watched branch (never on PRs). It lets a deploy branch
+// be gated behind green CI without GitHub Actions: e.g. watch `master`, and on
+// green fast-forward `release`, which a deploy poller then ships.
+//
+// This needs the GITHUB_TOKEN to have "Contents: write". Status reporting alone
+// only needs "Commit statuses: write" + "Contents: read", so promotion is opt-in
+// and the extra scope is only required when a repo's .poll-ci.yml requests it.
+type Promote struct {
+	Branch string `yaml:"branch"` // target branch to fast-forward, e.g. "release"
 }
 
 // LoadRunnerConfig builds the engine configuration from environment variables.
@@ -176,6 +189,9 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 			return nil, fmt.Errorf("duplicate check name %q", ck.Name)
 		}
 		seen[ck.Name] = true
+	}
+	if rc.Promote != nil && strings.TrimSpace(rc.Promote.Branch) == "" {
+		return nil, fmt.Errorf("promote: branch must be set (the target branch to fast-forward on green)")
 	}
 	return &rc, nil
 }

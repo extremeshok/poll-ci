@@ -110,6 +110,56 @@ func (g *GitHub) ListOpenPRs(ctx context.Context, ref Ref) ([]PR, error) {
 	return prs, nil
 }
 
+// FastForwardRef points branch at sha as a fast-forward (force=false, so GitHub
+// rejects a non-fast-forward update with 422). It creates the branch if it does
+// not exist yet. Needs the token to have "Contents: write".
+func (g *GitHub) FastForwardRef(ctx context.Context, ref Ref, branch, sha string) error {
+	url := fmt.Sprintf("%s/repos/%s/%s/git/refs/heads/%s", g.apiBase, ref.Owner, ref.Name, branch)
+	body, _ := json.Marshal(map[string]any{"sha": sha, "force": false})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	g.setHeaders(req)
+
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	// A 422 mentioning a missing reference means the branch is new — create it.
+	if resp.StatusCode == http.StatusUnprocessableEntity && bytes.Contains(bytes.ToLower(msg), []byte("does not exist")) {
+		return g.createRef(ctx, ref, branch, sha)
+	}
+	return fmt.Errorf("fast-forward %s to %s: %s: %s", branch, short(sha), resp.Status, bytes.TrimSpace(msg))
+}
+
+// createRef creates refs/heads/branch pointing at sha.
+func (g *GitHub) createRef(ctx context.Context, ref Ref, branch, sha string) error {
+	url := fmt.Sprintf("%s/repos/%s/%s/git/refs", g.apiBase, ref.Owner, ref.Name)
+	body, _ := json.Marshal(map[string]string{"ref": "refs/heads/" + branch, "sha": sha})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	g.setHeaders(req)
+
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	return fmt.Errorf("create %s at %s: %s: %s", branch, short(sha), resp.Status, bytes.TrimSpace(msg))
+}
+
 func (g *GitHub) setHeaders(req *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+g.token)
 	req.Header.Set("Accept", "application/vnd.github+json")

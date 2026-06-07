@@ -54,6 +54,37 @@ func TestParseRepoConfig(t *testing.T) {
 	}
 }
 
+func TestParseRepoConfigPromote(t *testing.T) {
+	// A valid promote block parses into Promote.Branch.
+	rc, err := parseRepoConfig([]byte("checks:\n  - name: t\n    run: echo hi\npromote:\n  branch: release\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc.Promote == nil || rc.Promote.Branch != "release" {
+		t.Fatalf("promote not parsed: %+v", rc.Promote)
+	}
+
+	// No promote block → nil (promotion is opt-in).
+	rc2, err := parseRepoConfig([]byte("checks:\n  - name: t\n    run: x\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc2.Promote != nil {
+		t.Errorf("expected nil promote, got %+v", rc2.Promote)
+	}
+
+	// promote present but blank/whitespace branch is an error.
+	for _, in := range []string{
+		"checks:\n  - name: t\n    run: x\npromote:\n  branch: \"\"\n",
+		"checks:\n  - name: t\n    run: x\npromote:\n  branch: \"   \"\n",
+		"checks:\n  - name: t\n    run: x\npromote: {}\n",
+	} {
+		if _, err := parseRepoConfig([]byte(in)); err == nil {
+			t.Errorf("expected error for promote without a branch: %q", in)
+		}
+	}
+}
+
 func TestLastLine(t *testing.T) {
 	cases := map[string]string{
 		"a\nb\nc\n":   "c",
