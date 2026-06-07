@@ -2,7 +2,7 @@
 #
 #   export GITHUB_TOKEN=github_pat_xxx
 #   cp repos.example.yml repos.yml   # then edit it
-#   docker compose up -d --build
+#   docker compose up -d
 #
 # See README.md for the security implications of mounting the Docker socket.
 

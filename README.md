@@ -157,6 +157,16 @@ the image name for brevity — that's the same image: the prebuilt
 > bare socket-only form still works — it just re-tests the current HEAD once
 > after each restart.
 
+> **Deploying for real?** Skip the manual `docker run` and use the **one-command
+> installer** for a boot-managed systemd service:
+>
+> ```bash
+> git clone https://github.com/extremeshok/poll-ci && sudo poll-ci/deploy/install.sh
+> ```
+>
+> It installs the systemd unit, pins the published image, and creates a 0600 env
+> file for your token — see [As a Docker service (systemd)](#as-a-docker-service-systemd).
+
 ---
 
 ## Tutorial: your first green check
@@ -411,7 +421,7 @@ GitHub Container Registry:
 
 ```
 ghcr.io/extremeshok/poll-ci:latest    # newest release
-ghcr.io/extremeshok/poll-ci:v1.0.0    # pin to a specific version (recommended for prod)
+ghcr.io/extremeshok/poll-ci:v1.1.0    # pin to a specific version (recommended for prod)
 ```
 
 Prefer building your own? `docker build -t poll-ci .` from a checkout — the
@@ -471,7 +481,7 @@ from the [releases page](https://github.com/extremeshok/poll-ci/releases), or
 ```bash
 # Prebuilt (Linux x86-64; see releases for other OS/arch + newer versions).
 # The tarball also contains README.md + LICENSE.
-curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.0.0/poll-ci_v1.0.0_linux_amd64.tar.gz | tar -xz
+curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.1.0/poll-ci_v1.1.0_linux_amd64.tar.gz | tar -xz
 sudo install poll-ci /usr/local/bin/
 
 # …or from source:
