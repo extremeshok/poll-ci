@@ -433,6 +433,33 @@ cp repos.example.yml repos.yml      # then edit it
 docker compose up -d               # pulls ghcr.io/extremeshok/poll-ci
 ```
 
+### As a Docker service (systemd)
+
+To have **systemd** start/stop the container — boot integration, `systemctl`
+control, logs via `journalctl` — instead of relying on Docker's `--restart`, use
+the bundled unit + installer in [`deploy/`](deploy):
+
+```bash
+# from a checkout on the host:
+sudo deploy/install.sh             # install + enable  (--build to build the
+                                   # image first, --start to start right away)
+sudoedit /etc/poll-ci/poll-ci.env  # set GITHUB_TOKEN  (this file is 0600)
+sudoedit /etc/poll-ci/repos.yml    # the repo(s) to watch
+sudo systemctl start poll-ci
+journalctl -u poll-ci -f
+```
+
+`install.sh` writes config under `/etc/poll-ci/` (never overwriting an existing
+env file), installs [`poll-ci.service`](deploy/systemd/poll-ci.service), and pins
+the image with a drop-in. The unit runs the container in the **foreground**, so
+`systemctl stop` is a graceful `docker stop` — poll-ci catches SIGTERM, the
+in-flight check unwinds, and it simply re-runs that commit on the next start.
+Manage it the usual way:
+
+```bash
+sudo systemctl start|stop|restart|status poll-ci
+```
+
 ### As a plain binary (systemd)
 
 poll-ci is a single binary; it shells out to `git` and `docker`, both of which

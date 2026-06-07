@@ -1,0 +1,40 @@
+[Unit]
+Description=poll-ci — polling CI for GitHub (Docker)
+Documentation=https://github.com/extremeshok/poll-ci
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+# Image + container name. deploy/install.sh writes a drop-in that pins these;
+# override by hand with `systemctl edit poll-ci`.
+Environment=POLL_CI_IMAGE=ghcr.io/extremeshok/poll-ci:latest
+Environment=POLL_CI_NAME=poll-ci
+
+# Run the container in the FOREGROUND so systemd supervises it directly:
+# `systemctl stop` runs ExecStop (a graceful `docker stop`), poll-ci catches
+# SIGTERM and unwinds the in-flight check, the container exits, and the attached
+# `docker run` returns — a clean stop. The token is read by Docker from the env
+# file via --env-file; it is never loaded into systemd's own environment.
+#
+# Pre-steps remove any stale container from an unclean shutdown and refresh the
+# image. The pull is best-effort (leading '-'), so a locally-built image works.
+ExecStartPre=-/usr/bin/docker rm -f ${POLL_CI_NAME}
+ExecStartPre=-/usr/bin/docker pull ${POLL_CI_IMAGE}
+ExecStart=/usr/bin/docker run --name ${POLL_CI_NAME} \
+    --env-file /etc/poll-ci/poll-ci.env \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v /etc/poll-ci/repos.yml:/config/repos.yml:ro \
+    -v poll-ci-state:/var/lib/poll-ci \
+    ${POLL_CI_IMAGE}
+ExecStop=/usr/bin/docker stop --time 60 ${POLL_CI_NAME}
+
+# Restart on crash; give in-flight checks time to unwind on stop.
+Restart=always
+RestartSec=5
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
