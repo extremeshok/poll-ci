@@ -47,15 +47,17 @@ install -d -m 0750 "$CONF_DIR"
 if [ ! -f "$CONF_DIR/poll-ci.env" ]; then
   ( umask 077
     cat > "$CONF_DIR/poll-ci.env" <<'ENV'
-# poll-ci config — THIS FILE HOLDS THE TOKEN. Keep it 0600.
+# poll-ci config — THIS FILE HOLDS THE TOKEN ONLY. Keep it 0600.
 # Fine-grained PAT repository permissions:
 #   Contents: Read and write        (read = clone + branch HEAD; write = promote:)
 #   Commit statuses: Read and write
+# The repo list lives in repos.yml; REPOS_FILE is set by the systemd unit. So
+# this file can safely contain just GITHUB_TOKEN.
 GITHUB_TOKEN=REPLACE_WITH_TOKEN
-REPOS_FILE=/config/repos.yml
-POLL_INTERVAL=60
-# DEFAULT_IMAGE=alpine:latest
+# Optional overrides:
+# POLL_INTERVAL=60
 # POLL_PRS=true
+# DEFAULT_IMAGE=alpine:latest
 ENV
   )
   chmod 600 "$CONF_DIR/poll-ci.env"

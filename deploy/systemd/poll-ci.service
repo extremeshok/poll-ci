@@ -23,7 +23,10 @@ Environment=POLL_CI_NAME=poll-ci
 # image. The pull is best-effort (leading '-'), so a locally-built image works.
 ExecStartPre=-/usr/bin/docker rm -f ${POLL_CI_NAME}
 ExecStartPre=-/usr/bin/docker pull ${POLL_CI_IMAGE}
+# REPOS_FILE is set here (not in the env file) so a token-only env file always
+# works; the env file can still override it. The repo list lives in repos.yml.
 ExecStart=/usr/bin/docker run --name ${POLL_CI_NAME} \
+    -e REPOS_FILE=/config/repos.yml \
     --env-file /etc/poll-ci/poll-ci.env \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v /etc/poll-ci/repos.yml:/config/repos.yml:ro \
