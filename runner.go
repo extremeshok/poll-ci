@@ -109,8 +109,10 @@ func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 	passed := r.runCommit(runCtx, ref, sha, dir)
 	cancel(nil) // run finished — stop the watcher
 
-	// Short-circuited: a newer commit superseded this run. Resolve the rollup,
-	// record the SHA so it isn't retried, and signal the caller to test the newer tip.
+	// Short-circuited: a newer commit superseded this run. runCommit has already
+	// resolved the per-check and ci/trivy contexts to "superseded"; here we resolve
+	// the `ci` rollup, record the SHA so it isn't retried, and signal the caller to
+	// test the newer tip.
 	var se *supersededError
 	if errors.As(context.Cause(runCtx), &se) {
 		log.Printf("[%s] %s %s — abandoning stale run", ref, short(sha), se.Error())
@@ -126,6 +128,11 @@ func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 	}
 	if passed {
 		r.maybePromote(ctx, ref, sha, dir)
+		if ctx.Err() != nil {
+			// Shutdown landed during promotion; leave the commit unmarked so it
+			// re-runs (and re-promotes) on restart rather than stranding ci/promote.
+			return false, nil
+		}
 	}
 	return false, r.store.Mark(ref, tip, sha)
 }
@@ -230,12 +237,18 @@ func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) bool {
 		r.setStatus(ctx, ref, sha, StatePending, "ci/trivy", "queued")
 	}
 
-	failed := 0
-	for _, ck := range rc.Checks {
+	// Run each check. `done` is the count of fully-resolved checks, so on a
+	// short-circuit rc.Checks[done:] is exactly the set still to terminalize.
+	failed, done := 0, 0
+	for ; done < len(rc.Checks); done++ {
 		if ctx.Err() != nil {
-			return false
+			break // cancelled before this check started
 		}
+		ck := rc.Checks[done]
 		ok, desc := r.runCheck(ctx, image, dir, ck)
+		if ctx.Err() != nil {
+			break // cancelled mid-check — discard the "cancelled" result; resolve it below
+		}
 		state := StateSuccess
 		if !ok {
 			state, failed = StateFailure, failed+1
@@ -246,16 +259,40 @@ func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) bool {
 
 	// Built-in trivy scan of the sources (opt-in via scan:). A finding fails the
 	// gate just like any check, so a promote: target won't advance.
-	if rc.Scan != nil && ctx.Err() == nil {
+	scanDone := false
+	if done == len(rc.Checks) && rc.Scan != nil && ctx.Err() == nil {
 		scanImage := rc.Scan.Image
 		r.ensureImage(ctx, scanImage)
 		ok, desc := r.runScan(ctx, scanImage, dir, rc.Scan)
-		state := StateSuccess
-		if !ok {
-			state, failed = StateFailure, failed+1
+		if ctx.Err() == nil { // cancelled mid-scan — discard the "cancelled" result; resolve it below
+			state := StateSuccess
+			if !ok {
+				state, failed = StateFailure, failed+1
+			}
+			log.Printf("[%s] %s ci/trivy → %s (%s)", ref, short(sha), state, desc)
+			r.setStatus(ctx, ref, sha, state, "ci/trivy", desc)
+			scanDone = true
 		}
-		log.Printf("[%s] %s ci/trivy → %s (%s)", ref, short(sha), state, desc)
-		r.setStatus(ctx, ref, sha, state, "ci/trivy", desc)
+	}
+
+	// Short-circuited by a newer commit: terminalize every context we did not
+	// resolve — the in-flight + not-yet-started checks, and the scan if unreached —
+	// so none lingers `pending` on this superseded SHA. Completed checks keep their
+	// real results; processBranchOnce resolves the matching `ci` rollup. (These
+	// posts land despite the now-cancelled ctx because setStatus detaches it.)
+	var se *supersededError
+	if errors.As(context.Cause(ctx), &se) {
+		for _, ck := range rc.Checks[done:] {
+			r.setStatus(ctx, ref, sha, StateError, "ci/"+ck.Name, se.Error())
+		}
+		if rc.Scan != nil && !scanDone {
+			r.setStatus(ctx, ref, sha, StateError, "ci/trivy", se.Error())
+		}
+		return false
+	}
+
+	if ctx.Err() != nil {
+		return false // engine shutdown — leave unresolved contexts pending; the commit re-runs on restart
 	}
 
 	if failed == 0 {

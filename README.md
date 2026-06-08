@@ -446,9 +446,10 @@ All configuration is environment variables.
 On a busy branch, commits can land faster than CI finishes. By default poll-ci
 **short-circuits**: while a run is in flight it keeps watching the branch tip,
 and the moment a newer commit appears it **aborts the stale run** (killing the
-in-flight check container), marks that commit's `ci` status `superseded by
-<sha>`, and jumps straight to the newest commit — so you never wait on CI for a
-commit that has already been replaced.
+in-flight check container), marks every unfinished status on that commit
+`superseded by <sha>` (checks that had already finished keep their real result),
+and jumps straight to the newest commit — so you never wait on CI for a commit
+that has already been replaced.
 
 The tip is re-checked every `POLL_INTERVAL` seconds during a run, so only runs
 longer than one interval get cut short. Set `SHORT_CIRCUIT=false` to disable it
@@ -501,7 +502,7 @@ GitHub Container Registry:
 
 ```
 ghcr.io/extremeshok/poll-ci:latest    # newest release
-ghcr.io/extremeshok/poll-ci:v1.3.0    # pin to a specific version (recommended for prod)
+ghcr.io/extremeshok/poll-ci:v1.3.1    # pin to a specific version (recommended for prod)
 ```
 
 Prefer building your own? `docker build -t poll-ci .` from a checkout — the
@@ -561,7 +562,7 @@ from the [releases page](https://github.com/extremeshok/poll-ci/releases), or
 ```bash
 # Prebuilt (Linux x86-64; see releases for other OS/arch + newer versions).
 # The tarball also contains README.md + LICENSE.
-curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.3.0/poll-ci_v1.3.0_linux_amd64.tar.gz | tar -xz
+curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.3.1/poll-ci_v1.3.1_linux_amd64.tar.gz | tar -xz
 sudo install poll-ci /usr/local/bin/
 
 # …or from source:

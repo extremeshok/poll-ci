@@ -4,10 +4,10 @@ import "runtime/debug"
 
 // version is overridable at build time:
 //
-//	go build -ldflags "-X main.version=v1.3.0"
+//	go build -ldflags "-X main.version=v1.3.1"
 //
 // It must stay initialized to a constant string for -X to take effect. When not
-// stamped (e.g. `go install …@v1.3.0`), init() fills it from the module version
+// stamped (e.g. `go install …@v1.3.1`), init() fills it from the module version
 // the Go toolchain embeds from the VCS tag.
 var version = ""
 
