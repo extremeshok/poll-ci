@@ -47,7 +47,16 @@ type RepoConfig struct {
 	Image   string   `yaml:"image"`
 	Checks  []Check  `yaml:"checks"`
 	Promote *Promote `yaml:"promote"`
+	Scan    *Scan    `yaml:"scan"`
 }
+
+// Default trivy image + cache volume for the built-in scan: step.
+const (
+	DefaultTrivyImage       = "aquasec/trivy:latest"
+	DefaultTrivyCacheVolume = "poll-ci-trivy-cache"
+	DefaultTrivyScanners    = "vuln,secret,misconfig"
+	DefaultTrivySeverity    = "HIGH,CRITICAL"
+)
 
 // Check is one named command to run.
 type Check struct {
@@ -66,6 +75,27 @@ type Check struct {
 // and the extra scope is only required when a repo's .poll-ci.yml requests it.
 type Promote struct {
 	Branch string `yaml:"branch"` // target branch to fast-forward, e.g. "release"
+}
+
+// Scan optionally runs a trivy filesystem scan of the checkout as a built-in
+// gate step, reported as a `ci/trivy` commit status. A finding fails the gate —
+// so, combined with promote:, vulnerable/secret-leaking/misconfigured source
+// never advances a deploy branch. This is shift-left supply-chain scanning of
+// the SOURCE (dependency manifests, leaked secrets, Dockerfile/IaC misconfig),
+// complementary to scanning built images at deploy time. trivy needs no GitHub
+// token. It runs via trivy's own entrypoint (argv passing — no shell), and its
+// vulnerability DB is cached in a named Docker volume so it isn't re-downloaded
+// every run.
+//
+// Minimal form is just `scan: {}` — every field defaults.
+type Scan struct {
+	Image         string `yaml:"image"`          // trivy image (default aquasec/trivy:latest)
+	Scanners      string `yaml:"scanners"`       // trivy --scanners (default vuln,secret,misconfig)
+	Severity      string `yaml:"severity"`       // trivy --severity (default HIGH,CRITICAL)
+	IgnoreUnfixed *bool  `yaml:"ignore-unfixed"` // trivy --ignore-unfixed (default true)
+	Path          string `yaml:"path"`           // sub-path under the repo to scan (default ".")
+	Timeout       int    `yaml:"timeout"`        // seconds; 0 → DefaultTimeout
+	CacheVolume   string `yaml:"cache-volume"`   // named volume for the trivy DB cache
 }
 
 // LoadRunnerConfig builds the engine configuration from environment variables.
@@ -193,7 +223,63 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 	if rc.Promote != nil && strings.TrimSpace(rc.Promote.Branch) == "" {
 		return nil, fmt.Errorf("promote: branch must be set (the target branch to fast-forward on green)")
 	}
+	if rc.Scan != nil {
+		s := rc.Scan
+		if s.Image == "" {
+			s.Image = DefaultTrivyImage
+		}
+		if s.Scanners == "" {
+			s.Scanners = DefaultTrivyScanners
+		}
+		if s.Severity == "" {
+			s.Severity = DefaultTrivySeverity
+		}
+		if s.CacheVolume == "" {
+			s.CacheVolume = DefaultTrivyCacheVolume
+		}
+		if strings.TrimSpace(s.Path) == "" {
+			s.Path = "."
+		}
+		// These values become docker/trivy argv. We pass them as separate args
+		// (no shell), but still reject anything outside a conservative charset so
+		// a typo can't smuggle an option or path separator surprise.
+		for _, f := range []struct{ name, val string }{
+			{"scan.image", s.Image}, {"scan.scanners", s.Scanners},
+			{"scan.severity", s.Severity}, {"scan.path", s.Path},
+			{"scan.cache-volume", s.CacheVolume},
+		} {
+			if !safeArg(f.val) {
+				return nil, fmt.Errorf("%s contains unsupported characters: %q", f.name, f.val)
+			}
+		}
+		if s.Timeout < 0 {
+			return nil, fmt.Errorf("scan.timeout must be >= 0")
+		}
+	}
 	return &rc, nil
+}
+
+// safeArg reports whether s is safe to pass as a single docker/trivy argument:
+// it must start alphanumeric and contain only a conservative set (covers image
+// refs like aquasec/trivy:0.58.1@sha256:…, scanner/severity CSV lists, and
+// relative paths). Excludes whitespace and shell metacharacters.
+func safeArg(s string) bool {
+	if s == "" {
+		return false
+	}
+	if !((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z') ||
+		(s[0] >= '0' && s[0] <= '9') || s[0] == '.') {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == ',' || c == '.' || c == '_' || c == '-' || c == '/' || c == ':' || c == '@' || c == '+':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // parseRef turns "owner/name" + branch into a Ref.

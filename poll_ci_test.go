@@ -85,6 +85,76 @@ func TestParseRepoConfigPromote(t *testing.T) {
 	}
 }
 
+func TestParseRepoConfigScan(t *testing.T) {
+	// No scan block → nil (scanning is opt-in).
+	rc0, err := parseRepoConfig([]byte("checks:\n  - name: t\n    run: x\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc0.Scan != nil {
+		t.Errorf("expected nil scan, got %+v", rc0.Scan)
+	}
+
+	// Minimal `scan: {}` → all fields default; ignore-unfixed defaults true.
+	rc, err := parseRepoConfig([]byte("checks:\n  - name: t\n    run: x\nscan: {}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc.Scan == nil {
+		t.Fatal("scan not parsed")
+	}
+	if rc.Scan.Image != DefaultTrivyImage || rc.Scan.Scanners != DefaultTrivyScanners ||
+		rc.Scan.Severity != DefaultTrivySeverity || rc.Scan.CacheVolume != DefaultTrivyCacheVolume ||
+		rc.Scan.Path != "." {
+		t.Fatalf("scan defaults not applied: %+v", rc.Scan)
+	}
+	if rc.Scan.IgnoreUnfixed != nil && *rc.Scan.IgnoreUnfixed != true {
+		t.Errorf("ignore-unfixed should default to true, got %v", *rc.Scan.IgnoreUnfixed)
+	}
+
+	// Overrides parse, including ignore-unfixed: false.
+	rc2, err := parseRepoConfig([]byte("checks:\n  - name: t\n    run: x\n" +
+		"scan:\n  image: aquasec/trivy:0.58.1\n  scanners: vuln\n  severity: CRITICAL\n" +
+		"  ignore-unfixed: false\n  path: web\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc2.Scan.Image != "aquasec/trivy:0.58.1" || rc2.Scan.Scanners != "vuln" ||
+		rc2.Scan.Severity != "CRITICAL" || rc2.Scan.Path != "web" {
+		t.Fatalf("scan overrides not parsed: %+v", rc2.Scan)
+	}
+	if rc2.Scan.IgnoreUnfixed == nil || *rc2.Scan.IgnoreUnfixed != false {
+		t.Errorf("ignore-unfixed: false not parsed: %+v", rc2.Scan.IgnoreUnfixed)
+	}
+
+	// Unsafe values (shell metacharacters) are rejected.
+	for _, in := range []string{
+		"checks:\n  - name: t\n    run: x\nscan:\n  severity: \"HIGH; rm -rf /\"\n",
+		"checks:\n  - name: t\n    run: x\nscan:\n  scanners: \"vuln`id`\"\n",
+		"checks:\n  - name: t\n    run: x\nscan:\n  image: \"a b\"\n",
+	} {
+		if _, err := parseRepoConfig([]byte(in)); err == nil {
+			t.Errorf("expected error for unsafe scan value: %q", in)
+		}
+	}
+}
+
+func TestSafeArg(t *testing.T) {
+	ok := []string{"aquasec/trivy:latest", "aquasec/trivy:0.58.1", "vuln,secret,misconfig",
+		"HIGH,CRITICAL", "web", ".", "ghcr.io/x/y@sha256:abc"}
+	for _, s := range ok {
+		if !safeArg(s) {
+			t.Errorf("safeArg(%q) = false, want true", s)
+		}
+	}
+	bad := []string{"", "a b", "a;b", "a|b", "a&b", "$(x)", "a`b`", "-flag", "a\nb"}
+	for _, s := range bad {
+		if safeArg(s) {
+			t.Errorf("safeArg(%q) = true, want false", s)
+		}
+	}
+}
+
 func TestLastLine(t *testing.T) {
 	cases := map[string]string{
 		"a\nb\nc\n":   "c",

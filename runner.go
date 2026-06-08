@@ -147,10 +147,19 @@ func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) bool {
 	}
 	r.ensureImage(ctx, image)
 
-	// Announce work immediately: overall pending + each check pending.
-	r.setStatus(ctx, ref, sha, StatePending, "ci", fmt.Sprintf("running %d checks", len(rc.Checks)))
+	// Total gate steps = checks + the optional built-in trivy scan.
+	total := len(rc.Checks)
+	if rc.Scan != nil {
+		total++
+	}
+
+	// Announce work immediately: overall pending + each step pending.
+	r.setStatus(ctx, ref, sha, StatePending, "ci", fmt.Sprintf("running %d checks", total))
 	for _, ck := range rc.Checks {
 		r.setStatus(ctx, ref, sha, StatePending, "ci/"+ck.Name, "queued")
+	}
+	if rc.Scan != nil {
+		r.setStatus(ctx, ref, sha, StatePending, "ci/trivy", "queued")
 	}
 
 	failed := 0
@@ -167,12 +176,85 @@ func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) bool {
 		r.setStatus(ctx, ref, sha, state, "ci/"+ck.Name, desc)
 	}
 
+	// Built-in trivy scan of the sources (opt-in via scan:). A finding fails the
+	// gate just like any check, so a promote: target won't advance.
+	if rc.Scan != nil && ctx.Err() == nil {
+		scanImage := rc.Scan.Image
+		r.ensureImage(ctx, scanImage)
+		ok, desc := r.runScan(ctx, scanImage, dir, rc.Scan)
+		state := StateSuccess
+		if !ok {
+			state, failed = StateFailure, failed+1
+		}
+		log.Printf("[%s] %s ci/trivy → %s (%s)", ref, short(sha), state, desc)
+		r.setStatus(ctx, ref, sha, state, "ci/trivy", desc)
+	}
+
 	if failed == 0 {
-		r.setStatus(ctx, ref, sha, StateSuccess, "ci", fmt.Sprintf("all %d checks passed", len(rc.Checks)))
+		r.setStatus(ctx, ref, sha, StateSuccess, "ci", fmt.Sprintf("all %d checks passed", total))
 		return true
 	}
-	r.setStatus(ctx, ref, sha, StateFailure, "ci", fmt.Sprintf("%d of %d checks failed", failed, len(rc.Checks)))
+	r.setStatus(ctx, ref, sha, StateFailure, "ci", fmt.Sprintf("%d of %d checks failed", failed, total))
 	return false
+}
+
+// runScan runs the configured trivy filesystem scan against the copied-in
+// checkout and returns (passed, one-line description). It mirrors runCheck but
+// uses trivy's own entrypoint with argv passing (no shell) and mounts a named
+// volume as the trivy cache so the vulnerability DB persists between runs.
+func (r *Runner) runScan(ctx context.Context, image, dir string, sc *Scan) (bool, string) {
+	timeout := r.cfg.DefaultTimeout
+	if sc.Timeout > 0 {
+		timeout = time.Duration(sc.Timeout) * time.Second
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	start := time.Now()
+
+	target := "/repo"
+	if p := strings.TrimSpace(sc.Path); p != "" && p != "." {
+		target = "/repo/" + strings.TrimPrefix(p, "/")
+	}
+	ignoreUnfixed := sc.IgnoreUnfixed == nil || *sc.IgnoreUnfixed
+	// trivy --cache-dir is global, so it precedes the subcommand.
+	args := []string{"--cache-dir", "/trivy-cache",
+		"fs", "--scanners", sc.Scanners, "--severity", sc.Severity,
+		"--exit-code", "1", "--no-progress"}
+	if ignoreUnfixed {
+		args = append(args, "--ignore-unfixed")
+	}
+	args = append(args, target)
+
+	cid, err := r.dockerCreateScan(cctx, image, sc.CacheVolume, args)
+	if err != nil {
+		return false, "scan container create failed: " + oneLine(scrub(err.Error(), r.cfg.Token))
+	}
+	defer r.dockerRemove(cid)
+
+	if err := r.dockerCopyIn(cctx, dir, cid); err != nil {
+		return false, "copy sources failed: " + oneLine(err.Error())
+	}
+
+	stdout, stderr := r.dockerStart(cctx, cid)
+	if cctx.Err() == context.DeadlineExceeded {
+		return false, fmt.Sprintf("timed out after %s", timeout)
+	}
+	if ctx.Err() != nil {
+		return false, "cancelled"
+	}
+
+	dur := time.Since(start).Round(time.Second)
+	if r.dockerExitCode(cid) == 0 {
+		return true, "no findings in " + dur.String()
+	}
+	last := lastLine(stderr)
+	if last == "" {
+		last = lastLine(stdout)
+	}
+	if last == "" {
+		last = "findings present (see logs)"
+	}
+	return false, "findings: " + last
 }
 
 // maybePromote fast-forwards the repo's configured promote.branch to the tested
@@ -310,6 +392,23 @@ func (r *Runner) ensureImage(ctx context.Context, image string) {
 // dockerCreate creates (but does not start) a container that runs the check.
 func (r *Runner) dockerCreate(ctx context.Context, image, run string) (string, error) {
 	out, errb, err := r.dockerRun(ctx, "create", "--label", "poll-ci", "-w", "/repo", image, "sh", "-ec", run)
+	if err != nil {
+		return "", fmt.Errorf("%v: %s", err, oneLine(errb))
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// dockerCreateScan creates (but does not start) the trivy scan container. Unlike
+// dockerCreate it does NOT wrap the command in `sh -ec`: it relies on the trivy
+// image's own entrypoint and passes trivyArgs as separate argv elements (so no
+// shell parses user-supplied scanners/severity/path). A named volume is mounted
+// as the trivy cache to persist the vulnerability DB across runs.
+func (r *Runner) dockerCreateScan(ctx context.Context, image, cacheVolume string, trivyArgs []string) (string, error) {
+	args := append([]string{
+		"create", "--label", "poll-ci", "-w", "/repo",
+		"-v", cacheVolume + ":/trivy-cache", image,
+	}, trivyArgs...)
+	out, errb, err := r.dockerRun(ctx, args...)
 	if err != nil {
 		return "", fmt.Errorf("%v: %s", err, oneLine(errb))
 	}

@@ -237,6 +237,9 @@ checks:
     timeout: 900          # seconds (optional → DEFAULT_TIMEOUT, 1800)
   - name: lint
     run: golangci-lint run
+scan: {}                  # optional: trivy source scan → "ci/trivy" (see below)
+promote:                  # optional: fast-forward a branch on green (see below)
+  branch: release
 ```
 
 **Rules and behavior:**
@@ -272,6 +275,45 @@ checks:
 - `run` may be multi-line YAML (`run: |`). It is **not** interpolated by
   poll-ci; it's handed verbatim to `sh -ec` in the container, so normal shell
   (`&&`, `|`, `$(...)`, env vars) works.
+
+### Scanning the source with trivy (`scan:`)
+
+Add a `scan:` block and poll-ci runs a [trivy](https://trivy.dev) **filesystem
+scan of the checkout** as a built-in gate step, reported as the **`ci/trivy`**
+commit status. A finding fails the gate exactly like a failing check — so paired
+with `promote:`, vulnerable dependencies, leaked secrets, or misconfigured
+Dockerfiles/IaC never advance a deploy branch. This is shift-left scanning of the
+**source** (manifests, secrets, config), complementary to scanning built images
+at deploy time. No GitHub token is needed.
+
+Minimal — every field defaults:
+
+```yaml
+scan: {}
+```
+
+Full form, defaults shown:
+
+```yaml
+scan:
+  image: aquasec/trivy:latest       # the trivy image (pin a digest for reproducibility)
+  scanners: vuln,secret,misconfig   # trivy --scanners
+  severity: HIGH,CRITICAL           # trivy --severity (a finding at/above this fails)
+  ignore-unfixed: true              # only fail on vulnerabilities that have a fix
+  path: .                           # sub-path under the repo to scan
+  timeout: 1800                     # seconds (optional → DEFAULT_TIMEOUT)
+  cache-volume: poll-ci-trivy-cache # named Docker volume for the trivy DB cache
+```
+
+- Runs after the checks, in the trivy image, against the copied-in `/repo` —
+  using trivy's own entrypoint with **argv passing (no shell)**, so the config
+  values can't smuggle shell metacharacters (they're charset-validated too).
+- The vulnerability DB lives in the `cache-volume` named volume, so it isn't
+  re-downloaded every run; trivy still refreshes it from its registry as needed,
+  so coverage stays current even when the trivy `image` is pinned.
+- Like checks, the scan **needs network** (first run downloads the DB) and runs
+  beside the Docker socket — so, as with checks, only point poll-ci at repos you
+  trust.
 
 ### Promoting a deploy branch on green (`promote:`)
 
@@ -445,7 +487,7 @@ GitHub Container Registry:
 
 ```
 ghcr.io/extremeshok/poll-ci:latest    # newest release
-ghcr.io/extremeshok/poll-ci:v1.1.0    # pin to a specific version (recommended for prod)
+ghcr.io/extremeshok/poll-ci:v1.2.0    # pin to a specific version (recommended for prod)
 ```
 
 Prefer building your own? `docker build -t poll-ci .` from a checkout — the
@@ -505,7 +547,7 @@ from the [releases page](https://github.com/extremeshok/poll-ci/releases), or
 ```bash
 # Prebuilt (Linux x86-64; see releases for other OS/arch + newer versions).
 # The tarball also contains README.md + LICENSE.
-curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.1.0/poll-ci_v1.1.0_linux_amd64.tar.gz | tar -xz
+curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.2.0/poll-ci_v1.2.0_linux_amd64.tar.gz | tar -xz
 sudo install poll-ci /usr/local/bin/
 
 # …or from source:
