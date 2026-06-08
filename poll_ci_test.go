@@ -6,8 +6,30 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
+
+func TestScanResult(t *testing.T) {
+	// Clean: exit 0 → passed, duration in the message.
+	ok, desc := scanResult(0, "HIGH,CRITICAL", 5*time.Second)
+	if !ok || desc != "no findings in 5s" {
+		t.Fatalf("clean: ok=%v desc=%q", ok, desc)
+	}
+	// Findings: exit 1 → failed, severity-aware message, and crucially NOT a
+	// scraped trivy log line (the bug this guards against).
+	ok, desc = scanResult(1, "HIGH,CRITICAL", 8*time.Second)
+	if ok {
+		t.Fatal("exit 1 should fail the scan")
+	}
+	if !strings.Contains(desc, "HIGH,CRITICAL") {
+		t.Errorf("description should name the severity: %q", desc)
+	}
+	if strings.Contains(desc, "INFO") || strings.Contains(desc, "config files") {
+		t.Errorf("description leaked a trivy log line: %q", desc)
+	}
+}
 
 func TestParseRef(t *testing.T) {
 	r, err := parseRef("owner/name", "")

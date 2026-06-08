@@ -216,8 +216,10 @@ func (r *Runner) runScan(ctx context.Context, image, dir string, sc *Scan) (bool
 		target = "/repo/" + strings.TrimPrefix(p, "/")
 	}
 	ignoreUnfixed := sc.IgnoreUnfixed == nil || *sc.IgnoreUnfixed
-	// trivy --cache-dir is global, so it precedes the subcommand.
-	args := []string{"--cache-dir", "/trivy-cache",
+	// trivy --cache-dir and --quiet are global, so they precede the subcommand.
+	// --quiet silences trivy's INFO logger (stderr); the findings report still
+	// prints to stdout, so it's streamed to the engine logs for the operator.
+	args := []string{"--cache-dir", "/trivy-cache", "--quiet",
 		"fs", "--scanners", sc.Scanners, "--severity", sc.Severity,
 		"--exit-code", "1", "--no-progress"}
 	if ignoreUnfixed {
@@ -235,26 +237,27 @@ func (r *Runner) runScan(ctx context.Context, image, dir string, sc *Scan) (bool
 		return false, "copy sources failed: " + oneLine(err.Error())
 	}
 
-	stdout, stderr := r.dockerStart(cctx, cid)
+	r.dockerStart(cctx, cid) // streams trivy's report to the logs; blocks until exit
 	if cctx.Err() == context.DeadlineExceeded {
 		return false, fmt.Sprintf("timed out after %s", timeout)
 	}
 	if ctx.Err() != nil {
 		return false, "cancelled"
 	}
+	return scanResult(r.dockerExitCode(cid), sc.Severity, time.Since(start).Round(time.Second))
+}
 
-	dur := time.Since(start).Round(time.Second)
-	if r.dockerExitCode(cid) == 0 {
+// scanResult maps a trivy exit code to (passed, one-line description). trivy
+// exits 0 when nothing is found and 1 when it finds something at or above the
+// configured severity. The findings themselves go to the streamed logs, so the
+// description is a clear summary rather than a scraped output line (trivy writes
+// its report to stdout and INFO logs to stderr — the opposite of a normal check,
+// which is what made the old "last stderr line" heuristic misleading here).
+func scanResult(exitCode int, severity string, dur time.Duration) (bool, string) {
+	if exitCode == 0 {
 		return true, "no findings in " + dur.String()
 	}
-	last := lastLine(stderr)
-	if last == "" {
-		last = lastLine(stdout)
-	}
-	if last == "" {
-		last = "findings present (see logs)"
-	}
-	return false, "findings: " + last
+	return false, "trivy found issues at " + severity + " — see ci/trivy logs"
 }
 
 // maybePromote fast-forwards the repo's configured promote.branch to the tested
