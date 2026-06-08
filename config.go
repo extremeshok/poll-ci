@@ -40,6 +40,7 @@ type RunnerConfig struct {
 	DefaultTimeout time.Duration // DEFAULT_TIMEOUT seconds per check (default 1800)
 	DockerBin      string        // DOCKER_BIN (default "docker")
 	PollPRs        bool          // POLL_PRS — also test same-repo open PR heads
+	ShortCircuit   bool          // SHORT_CIRCUIT — abort a stale run when a newer tip appears (default true)
 }
 
 // RepoConfig is a repository's .poll-ci.yml.
@@ -109,6 +110,7 @@ func LoadRunnerConfig() (*RunnerConfig, error) {
 		DefaultImage:   envOr("DEFAULT_IMAGE", "alpine:latest"),
 		DockerBin:      envOr("DOCKER_BIN", "docker"),
 		PollPRs:        truthy(os.Getenv("POLL_PRS")),
+		ShortCircuit:   boolEnv("SHORT_CIRCUIT", true),
 		PollInterval:   secondsOr("POLL_INTERVAL", 60),
 		DefaultTimeout: secondsOr("DEFAULT_TIMEOUT", 1800),
 	}
@@ -316,4 +318,15 @@ func truthy(v string) bool {
 		return true
 	}
 	return false
+}
+
+// boolEnv reads a boolean env var, returning def when unset or unrecognized.
+func boolEnv(key string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return def
 }

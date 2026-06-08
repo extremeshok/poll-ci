@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +11,44 @@ import (
 	"testing"
 	"time"
 )
+
+func TestBoolEnv(t *testing.T) {
+	const k = "POLLCI_TEST_SHORT_CIRCUIT"
+	os.Unsetenv(k)
+	if !boolEnv(k, true) || boolEnv(k, false) {
+		t.Error("unset should return the default")
+	}
+	for _, v := range []string{"1", "true", "TRUE", "yes", "on"} {
+		t.Setenv(k, v)
+		if !boolEnv(k, false) {
+			t.Errorf("boolEnv(%q) should be true", v)
+		}
+	}
+	for _, v := range []string{"0", "false", "No", "off"} {
+		t.Setenv(k, v)
+		if boolEnv(k, true) {
+			t.Errorf("boolEnv(%q) should be false", v)
+		}
+	}
+	t.Setenv(k, "garbage")
+	if !boolEnv(k, true) || boolEnv(k, false) {
+		t.Error("unrecognized value should return the default")
+	}
+}
+
+func TestSupersededError(t *testing.T) {
+	err := error(&supersededError{by: "abc1234"})
+	if err.Error() != "superseded by abc1234" {
+		t.Errorf("message: %q", err.Error())
+	}
+	var se *supersededError
+	if !errors.As(err, &se) || se.by != "abc1234" {
+		t.Errorf("errors.As should extract the newer SHA, got %+v", se)
+	}
+	if errors.As(errors.New("unrelated"), &se) {
+		t.Error("a plain error must not match supersededError")
+	}
+}
 
 func TestScanResult(t *testing.T) {
 	// Clean: exit 0 → passed, duration in the message.

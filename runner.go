@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -53,35 +54,102 @@ func (r *Runner) PollOnce(ctx context.Context) {
 	}
 }
 
-// processBranch handles one watched branch: detect a new HEAD, then run it.
+// supersededError is the cancellation cause used when a newer commit appears
+// mid-run; `by` is the short SHA of the newer tip.
+type supersededError struct{ by string }
+
+func (e *supersededError) Error() string { return "superseded by " + e.by }
+
+// processBranch handles one watched branch: detect a new HEAD and run it. When
+// short-circuiting is enabled (default) and a newer commit lands while a run is
+// in flight, that run is aborted and the loop jumps straight to the newest tip —
+// so a busy repo never wastes a full CI run on an already-superseded commit.
 func (r *Runner) processBranch(ctx context.Context, ref Ref) error {
+	for {
+		superseded, err := r.processBranchOnce(ctx, ref)
+		if err != nil {
+			return err
+		}
+		if !superseded || ctx.Err() != nil {
+			return nil
+		}
+		// A newer commit arrived mid-run — loop immediately to test it.
+	}
+}
+
+// processBranchOnce processes the current tip once, returning superseded=true if
+// the run was aborted because a newer commit appeared (the caller then loops).
+func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 	tip, err := r.gitLsRemote(ctx, ref)
 	if err != nil {
-		return fmt.Errorf("ls-remote: %w", err)
+		return false, fmt.Errorf("ls-remote: %w", err)
 	}
 	if r.store.Has(ref, tip) {
-		return nil // already processed this exact commit
+		return false, nil // already processed this exact commit
 	}
 	log.Printf("[%s] new commit %s", ref, short(tip))
 
 	dir, sha, err := r.cloneBranch(ctx, ref)
 	if err != nil {
-		return fmt.Errorf("clone: %w", err)
+		return false, fmt.Errorf("clone: %w", err)
 	}
 	defer os.RemoveAll(dir)
 
 	// The branch may have moved between ls-remote and clone; trust the cloned SHA.
 	if r.store.Has(ref, sha) {
-		return r.store.Mark(ref, tip)
+		return false, r.store.Mark(ref, tip)
 	}
-	passed := r.runCommit(ctx, ref, sha, dir)
+
+	// Run under a cancellable context; a watcher aborts it if a newer tip lands.
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil) // leak-safety; the explicit cancel below stops the watcher promptly
+	if r.cfg.ShortCircuit {
+		go r.watchForNewerTip(runCtx, ref, sha, cancel)
+	}
+	passed := r.runCommit(runCtx, ref, sha, dir)
+	cancel(nil) // run finished — stop the watcher
+
+	// Short-circuited: a newer commit superseded this run. Resolve the rollup,
+	// record the SHA so it isn't retried, and signal the caller to test the newer tip.
+	var se *supersededError
+	if errors.As(context.Cause(runCtx), &se) {
+		log.Printf("[%s] %s %s — abandoning stale run", ref, short(sha), se.Error())
+		r.setStatus(ctx, ref, sha, StateError, "ci", se.Error())
+		if err := r.store.Mark(ref, sha); err != nil {
+			log.Printf("[%s] state: %v", ref, err)
+		}
+		return true, nil
+	}
+
 	if ctx.Err() != nil {
-		return nil // interrupted by shutdown — leave unmarked so it retries on restart
+		return false, nil // engine shutdown — leave unmarked so it retries on restart
 	}
 	if passed {
 		r.maybePromote(ctx, ref, sha, dir)
 	}
-	return r.store.Mark(ref, tip, sha)
+	return false, r.store.Mark(ref, tip, sha)
+}
+
+// watchForNewerTip polls the branch tip during a run and cancels it (with a
+// supersededError cause) the moment the tip differs from the commit under test,
+// letting the engine abandon the stale run and jump to the newest commit.
+func (r *Runner) watchForNewerTip(ctx context.Context, ref Ref, running string, cancel context.CancelCauseFunc) {
+	ticker := time.NewTicker(r.cfg.PollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tip, err := r.gitLsRemote(ctx, ref)
+			if err != nil || tip == "" || tip == running {
+				continue // transient error, or tip unchanged — keep running
+			}
+			log.Printf("[%s] newer commit %s arrived during run of %s — short-circuiting", ref, short(tip), short(running))
+			cancel(&supersededError{by: short(tip)})
+			return
+		}
+	}
 }
 
 // processPRs runs same-repo open PR heads. Fork PRs are intentionally skipped:

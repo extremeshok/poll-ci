@@ -436,9 +436,23 @@ All configuration is environment variables.
 | `WORK_DIR`        | `/var/lib/poll-ci`       | Scratch clones + state file (mount a volume here to persist)  |
 | `STATE_FILE`      | `$WORK_DIR/state.json`   | Where the tested-SHA set is stored                            |
 | `POLL_PRS`        | `false`                  | Also test open **same-repo** PR heads (see [Security](#security)) |
+| `SHORT_CIRCUIT`   | `true`                   | Abort a run when a newer commit lands mid-run and jump to it ([why](#short-circuiting-superseded-runs)) |
 | `GITHUB_API`      | `https://api.github.com` | API base — set for GitHub Enterprise Server                   |
 | `GIT_HOST`        | `github.com`             | Git host for clones — set for GHES                            |
 | `DOCKER_BIN`      | `docker`                 | Docker CLI to invoke                                          |
+
+### Short-circuiting superseded runs
+
+On a busy branch, commits can land faster than CI finishes. By default poll-ci
+**short-circuits**: while a run is in flight it keeps watching the branch tip,
+and the moment a newer commit appears it **aborts the stale run** (killing the
+in-flight check container), marks that commit's `ci` status `superseded by
+<sha>`, and jumps straight to the newest commit — so you never wait on CI for a
+commit that has already been replaced.
+
+The tip is re-checked every `POLL_INTERVAL` seconds during a run, so only runs
+longer than one interval get cut short. Set `SHORT_CIRCUIT=false` to disable it
+and run every commit you start to completion.
 
 ### Watching multiple repos
 
@@ -487,7 +501,7 @@ GitHub Container Registry:
 
 ```
 ghcr.io/extremeshok/poll-ci:latest    # newest release
-ghcr.io/extremeshok/poll-ci:v1.2.1    # pin to a specific version (recommended for prod)
+ghcr.io/extremeshok/poll-ci:v1.3.0    # pin to a specific version (recommended for prod)
 ```
 
 Prefer building your own? `docker build -t poll-ci .` from a checkout — the
@@ -547,7 +561,7 @@ from the [releases page](https://github.com/extremeshok/poll-ci/releases), or
 ```bash
 # Prebuilt (Linux x86-64; see releases for other OS/arch + newer versions).
 # The tarball also contains README.md + LICENSE.
-curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.2.1/poll-ci_v1.2.1_linux_amd64.tar.gz | tar -xz
+curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.3.0/poll-ci_v1.3.0_linux_amd64.tar.gz | tar -xz
 sudo install poll-ci /usr/local/bin/
 
 # …or from source:
