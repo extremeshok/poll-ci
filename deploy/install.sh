@@ -5,11 +5,16 @@
 #   sudo deploy/install.sh            # install + enable (set the token after)
 #   sudo deploy/install.sh --build    # also build the image from this checkout
 #   sudo deploy/install.sh --start    # also (re)start once config is in place
+#   sudo deploy/install.sh --heartbeat  # also install the dead-man's-switch timer
 #
 # Creates (config files only if missing — re-running never overwrites secrets):
 #   /etc/poll-ci/poll-ci.env            0600, holds GITHUB_TOKEN
 #   /etc/poll-ci/repos.yml              repos to watch
 #   /etc/systemd/system/poll-ci.service + a drop-in pinning the image
+# With --heartbeat, also:
+#   /usr/local/bin/poll-ci-heartbeat                       the monitor script
+#   /etc/poll-ci/heartbeat.env                             0640, HEARTBEAT_* config
+#   /etc/systemd/system/poll-ci-heartbeat.{service,timer}  the periodic check
 #
 # Override the image/name:  POLL_CI_IMAGE=… POLL_CI_NAME=… sudo deploy/install.sh
 set -euo pipefail
@@ -23,11 +28,13 @@ UNIT_SRC="${SRC_DIR}/systemd/poll-ci.service"
 
 DO_BUILD=false
 DO_START=false
+DO_HEARTBEAT=false
 for a in "$@"; do
   case "$a" in
     --build) DO_BUILD=true ;;
     --start) DO_START=true ;;
-    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --heartbeat) DO_HEARTBEAT=true ;;
+    -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $a" >&2; exit 2 ;;
   esac
 done
@@ -86,9 +93,39 @@ Environment=POLL_CI_IMAGE=${IMAGE}
 Environment=POLL_CI_NAME=${NAME}
 EOF
 
+if [ "$DO_HEARTBEAT" = true ]; then
+  install -m 0755 "${SRC_DIR}/heartbeat-monitor.sh" /usr/local/bin/poll-ci-heartbeat
+  install -m 0644 "${SRC_DIR}/systemd/poll-ci-heartbeat.service" /etc/systemd/system/poll-ci-heartbeat.service
+  install -m 0644 "${SRC_DIR}/systemd/poll-ci-heartbeat.timer"   /etc/systemd/system/poll-ci-heartbeat.timer
+  if [ ! -f "$CONF_DIR/heartbeat.env" ]; then
+    ( umask 027
+      cat > "$CONF_DIR/heartbeat.env" <<'HENV'
+# poll-ci-heartbeat config. The monitor also sources poll-ci.env for GITHUB_TOKEN.
+HEARTBEAT_REPO=extremeshok/dnscontrol-ui
+# Where to send alerts (apprise JSON endpoint or any webhook taking {title,body}):
+# HEARTBEAT_ALERT_URL=
+# Optional external dead-man's-switch pinged on every HEALTHY run (e.g. healthchecks.io):
+# HEARTBEAT_PING_URL=
+# Tuning (defaults shown):
+# HEARTBEAT_WATCH_BRANCH=master
+# HEARTBEAT_TARGET_BRANCH=release
+# HEARTBEAT_MAX_LAG=1
+# HEARTBEAT_GRACE_SECONDS=2400
+HENV
+    )
+    echo ">> created $CONF_DIR/heartbeat.env  (set HEARTBEAT_ALERT_URL)"
+  else
+    echo ">> keeping existing $CONF_DIR/heartbeat.env"
+  fi
+fi
+
 systemctl daemon-reload
 systemctl enable poll-ci.service >/dev/null
 echo ">> installed + enabled poll-ci.service (image ${IMAGE})"
+if [ "$DO_HEARTBEAT" = true ]; then
+  systemctl enable --now poll-ci-heartbeat.timer >/dev/null
+  echo ">> installed + enabled poll-ci-heartbeat.timer (edit ${CONF_DIR}/heartbeat.env, set HEARTBEAT_ALERT_URL)"
+fi
 
 if [ "$DO_START" = true ]; then
   systemctl restart poll-ci.service

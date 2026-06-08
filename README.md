@@ -300,6 +300,30 @@ promote:
   extra scope is required only when a repo asks for it; a token without it yields
   a clear `ci/promote` failure rather than a silent no-op.
 
+#### Heartbeat (dead-man's-switch for the promotion pipeline)
+
+poll-ci is a single container on one host holding one token. If it dies, the
+token expires, or the gate silently goes red, `release` just stops advancing and
+nobody is paged. [`deploy/heartbeat-monitor.sh`](deploy/heartbeat-monitor.sh)
+(run from [`poll-ci-heartbeat.timer`](deploy/systemd/poll-ci-heartbeat.timer))
+closes that gap. It alerts when **either** the poll-ci container is not running,
+**or** the watched branch has led the target branch by more than `MAX_LAG`
+commits **and** the target has not advanced for longer than `GRACE` (so a gate
+that is merely in progress doesn't page you — only a genuine stall does). On
+every healthy run it can also ping an external dead-man's-switch
+(`HEARTBEAT_PING_URL`, e.g. healthchecks.io), so you're covered even if the
+monitor or the whole host dies.
+
+```bash
+sudo deploy/install.sh --heartbeat     # installs the script + timer + heartbeat.env
+sudo "$EDITOR" /etc/poll-ci/heartbeat.env   # set HEARTBEAT_ALERT_URL (and repo)
+```
+
+It reuses `GITHUB_TOKEN` from `poll-ci.env`; config (`HEARTBEAT_REPO`,
+`HEARTBEAT_ALERT_URL`, `HEARTBEAT_PING_URL`, thresholds) lives in
+`/etc/poll-ci/heartbeat.env`. Exits 0 always — a monitor must never crash its own
+timer.
+
 ---
 
 ## Example configs

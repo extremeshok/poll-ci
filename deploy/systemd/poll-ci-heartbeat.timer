@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the poll-ci heartbeat check periodically
+Documentation=https://github.com/extremeshok/poll-ci
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=poll-ci-heartbeat.service
+
+[Install]
+WantedBy=timers.target

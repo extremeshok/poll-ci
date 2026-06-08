@@ -1,0 +1,16 @@
+[Unit]
+Description=poll-ci heartbeat — dead-man's-switch for the promotion pipeline
+Documentation=https://github.com/extremeshok/poll-ci
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Heartbeat config: HEARTBEAT_REPO=owner/name (required), HEARTBEAT_ALERT_URL,
+# optional HEARTBEAT_PING_URL + thresholds. The script also sources
+# /etc/poll-ci/poll-ci.env (HEARTBEAT_ENV_FILE) for GITHUB_TOKEN / POLL_CI_NAME.
+EnvironmentFile=-/etc/poll-ci/heartbeat.env
+ExecStart=/usr/local/bin/poll-ci-heartbeat
+# State (the stall-clock file) lives in /var/lib/poll-ci.
+StateDirectory=poll-ci
+Nice=10
