@@ -270,6 +270,46 @@ func TestScrubAndOneLine(t *testing.T) {
 	}
 }
 
+func TestNeedsPull(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name    string
+		present bool
+		last    time.Time
+		refresh time.Duration
+		want    bool
+	}{
+		{"absent always pulls", false, now, 0, true},
+		{"present, no refresh window", true, time.Time{}, 0, false},
+		{"present, window not lapsed", true, now.Add(-time.Hour), 24 * time.Hour, false},
+		{"present, window lapsed", true, now.Add(-25 * time.Hour), 24 * time.Hour, true},
+		{"present, never pulled by us, window set", true, time.Time{}, 24 * time.Hour, true},
+	}
+	for _, c := range cases {
+		if got := needsPull(c.present, c.last, c.refresh); got != c.want {
+			t.Errorf("%s: needsPull = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestIntEnv(t *testing.T) {
+	const k = "POLLCI_TEST_INT"
+	os.Unsetenv(k)
+	if got := intEnv(k, 7); got != 7 {
+		t.Errorf("unset: got %d", got)
+	}
+	t.Setenv(k, "12")
+	if got := intEnv(k, 7); got != 12 {
+		t.Errorf("valid: got %d", got)
+	}
+	for _, bad := range []string{"garbage", "-3", "1.5"} {
+		t.Setenv(k, bad)
+		if got := intEnv(k, 7); got != 7 {
+			t.Errorf("%q: got %d, want fallback 7", bad, got)
+		}
+	}
+}
+
 func TestLimitArgs(t *testing.T) {
 	r := &Runner{cfg: &RunnerConfig{}}
 	if got := r.limitArgs(); len(got) != 0 {

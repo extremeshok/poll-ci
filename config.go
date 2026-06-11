@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -45,6 +46,7 @@ type RunnerConfig struct {
 	CheckMemory    string        // CHECK_MEMORY — docker --memory for check/scan containers (e.g. "2g"; empty = unlimited)
 	CheckCPUs      string        // CHECK_CPUS — docker --cpus (e.g. "2"; empty = unlimited)
 	CheckPids      string        // CHECK_PIDS — docker --pids-limit (e.g. "4096"; empty = unlimited)
+	ImageRefresh   time.Duration // IMAGE_REFRESH_HOURS — re-pull present images this often (0 = never, the default)
 }
 
 // RepoConfig is a repository's .poll-ci.yml.
@@ -121,6 +123,7 @@ func LoadRunnerConfig() (*RunnerConfig, error) {
 		CheckPids:      os.Getenv("CHECK_PIDS"),
 		PollInterval:   secondsOr("POLL_INTERVAL", 60),
 		DefaultTimeout: secondsOr("DEFAULT_TIMEOUT", 1800),
+		ImageRefresh:   time.Duration(intEnv("IMAGE_REFRESH_HOURS", 0)) * time.Hour,
 	}
 	if c.Token == "" {
 		return nil, fmt.Errorf("GITHUB_TOKEN is required")
@@ -326,6 +329,21 @@ func secondsOr(key string, def int) time.Duration {
 		}
 	}
 	return time.Duration(def) * time.Second
+}
+
+// intEnv reads a non-negative integer env var, warning (and falling back to
+// def) on anything unparseable rather than silently ignoring it.
+func intEnv(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		log.Printf("config: ignoring invalid %s=%q (want a non-negative integer); using %d", key, v, def)
+		return def
+	}
+	return n
 }
 
 func truthy(v string) bool {

@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,6 +34,9 @@ type Runner struct {
 	authB64  string   // base64("x-access-token:" + token), for git's auth header
 	secrets  []string // every form of the token that must never reach a log line
 	instance string   // label value scoping this instance's containers for the orphan sweep
+
+	pullMu sync.Mutex           // guards pulled (PollOnce may run refs concurrently)
+	pulled map[string]time.Time // image → last pull attempt, for IMAGE_REFRESH_HOURS
 }
 
 // NewRunner constructs a Runner.
@@ -43,6 +47,7 @@ func NewRunner(cfg *RunnerConfig, gh *GitHub, store *Store) *Runner {
 		authB64:  auth,
 		secrets:  []string{cfg.Token, auth},
 		instance: instanceID(cfg.StateFile),
+		pulled:   map[string]time.Time{},
 	}
 }
 
@@ -659,10 +664,19 @@ func (r *Runner) setStatus(ctx context.Context, ref Ref, sha, state, sctx, desc 
 
 // --- Docker helpers (sibling containers via the host socket) ----------------
 
-// ensureImage pulls the image only if it isn't already present, so the per-check
-// timeout never includes a first-time pull.
+// ensureImage pulls the image if it isn't already present, so the per-check
+// timeout never includes a first-time pull. With IMAGE_REFRESH_HOURS set, a
+// present image is also re-pulled once the window lapses — otherwise a
+// `:latest` tag stays frozen at whatever the first pull happened to fetch.
 func (r *Runner) ensureImage(ctx context.Context, image string) {
-	if exec.CommandContext(ctx, r.cfg.DockerBin, "image", "inspect", image).Run() == nil {
+	present := exec.CommandContext(ctx, r.cfg.DockerBin, "image", "inspect", image).Run() == nil
+	r.pullMu.Lock()
+	need := needsPull(present, r.pulled[image], r.cfg.ImageRefresh)
+	if need {
+		r.pulled[image] = time.Now() // record the attempt; a failure falls through to create
+	}
+	r.pullMu.Unlock()
+	if !need {
 		return
 	}
 	log.Printf("pulling image %s", image)
@@ -671,9 +685,25 @@ func (r *Runner) ensureImage(ctx context.Context, image string) {
 	defer cancel()
 	cmd := exec.CommandContext(pctx, r.cfg.DockerBin, "pull", image)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	if err := cmd.Run(); err != nil {
+	switch err := cmd.Run(); {
+	case err != nil && present:
+		log.Printf("refresh pull %s failed (keeping cached image): %v", image, err)
+	case err != nil:
 		log.Printf("pull %s failed (will let create surface it): %v", image, err)
 	}
+}
+
+// needsPull decides whether ensureImage should pull: always when the image is
+// absent; when present, only if a refresh window is configured and has lapsed
+// since the last attempt.
+func needsPull(present bool, last time.Time, refresh time.Duration) bool {
+	if !present {
+		return true
+	}
+	if refresh <= 0 {
+		return false
+	}
+	return time.Since(last) >= refresh
 }
 
 // dockerCreate creates (but does not start) a container that runs the check.
