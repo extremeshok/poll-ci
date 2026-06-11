@@ -93,8 +93,11 @@ Every `POLL_INTERVAL` seconds, for each watched branch:
    streams the checkout in over `docker cp`, runs the command, and captures the
    exit code and output.
 6. **Report** — posts `success`/`failure` per check with a one-line summary,
-   then an overall `ci` rollup (`success` only if every check passed).
-7. **Remember** — records the SHA so it never runs twice, and survives restarts.
+   then an overall `ci` rollup (`success` only if every check passed). Posts
+   are retried on transient failures, so a network blip can't strand a
+   context on `pending`.
+7. **Remember** — records the SHA so it never runs twice, and survives restarts
+   (entries older than ~6 months are pruned; a branch's last result never is).
 
 Sources reach the check container over the Docker API (a streamed tar), so the
 canonical deployment needs **nothing mounted but the Docker socket** — no shared
@@ -182,7 +185,7 @@ A complete walk-through, from nothing to a green check-mark.
 fails, so you can see both colors:
 
 ```yaml
-image: alpine:3.20
+image: alpine:3.24
 checks:
   - name: hello
     run: echo "poll-ci is working"
@@ -413,7 +416,7 @@ checks:
 **A plain shell / Makefile project**
 
 ```yaml
-image: alpine:3.20
+image: alpine:3.24
 checks:
   - { name: ci, run: apk add --no-cache make && make test }
 ```
@@ -437,6 +440,12 @@ All configuration is environment variables.
 | `STATE_FILE`      | `$WORK_DIR/state.json`   | Where the tested-SHA set is stored                            |
 | `POLL_PRS`        | `false`                  | Also test open **same-repo** PR heads (see [Security](#security)) |
 | `SHORT_CIRCUIT`   | `true`                   | Abort a run when a newer commit lands mid-run and jump to it ([why](#short-circuiting-superseded-runs)) |
+| `MARK_SKIPPED`    | `false`                  | Post a terminal `ci` status on never-tested intermediate commits ([details](#marking-skipped-commits-mark_skipped)) |
+| `CONCURRENCY`     | `1`                      | Refs swept in parallel — useful with a multi-repo `REPOS_FILE` |
+| `CHECK_MEMORY`    | *(unlimited)*            | `docker --memory` for check/scan containers, e.g. `2g`        |
+| `CHECK_CPUS`      | *(unlimited)*            | `docker --cpus` for check/scan containers, e.g. `2`           |
+| `CHECK_PIDS`      | *(unlimited)*            | `docker --pids-limit` for check/scan containers, e.g. `4096`  |
+| `IMAGE_REFRESH_HOURS` | `0` (never)          | Re-pull present check images this often, so `:latest` tags don't freeze at first pull |
 | `GITHUB_API`      | `https://api.github.com` | API base — set for GitHub Enterprise Server                   |
 | `GIT_HOST`        | `github.com`             | Git host for clones — set for GHES                            |
 | `DOCKER_BIN`      | `docker`                 | Docker CLI to invoke                                          |
@@ -453,7 +462,27 @@ that has already been replaced.
 
 The tip is re-checked every `POLL_INTERVAL` seconds during a run, so only runs
 longer than one interval get cut short. Set `SHORT_CIRCUIT=false` to disable it
-and run every commit you start to completion.
+and run every commit you start to completion. With `POLL_PRS`, PR runs get the
+same treatment: a force-push to the PR head aborts the now-stale run.
+
+A superseded commit is *not* remembered as processed: if the branch is later
+force-pushed **back** to it (a revert), it re-runs for real instead of keeping
+its stale "superseded" statuses forever.
+
+### Marking skipped commits (`MARK_SKIPPED`)
+
+poll-ci tests branch **HEADs** only, so the intermediate commits of a fast
+multi-commit push get no statuses at all — ambiguous on the commits page, and
+they ride into a `promote:` branch untested. With `MARK_SKIPPED=true`, after
+each branch run poll-ci compares the previously tested commit to the new one
+and posts a single terminal `ci` status on every commit in between:
+
+```
+✗ ci    not tested — superseded by a1b2c3d
+```
+
+It is an `error` status on purpose — a green check would let branch protection
+pass a commit that never ran. Off by default.
 
 ### Watching multiple repos
 
@@ -502,7 +531,7 @@ GitHub Container Registry:
 
 ```
 ghcr.io/extremeshok/poll-ci:latest    # newest release
-ghcr.io/extremeshok/poll-ci:v1.3.1    # pin to a specific version (recommended for prod)
+ghcr.io/extremeshok/poll-ci:v1.4.0    # pin to a specific version (recommended for prod)
 ```
 
 Prefer building your own? `docker build -t poll-ci .` from a checkout — the
@@ -562,7 +591,7 @@ from the [releases page](https://github.com/extremeshok/poll-ci/releases), or
 ```bash
 # Prebuilt (Linux x86-64; see releases for other OS/arch + newer versions).
 # The tarball also contains README.md + LICENSE.
-curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.3.1/poll-ci_v1.3.1_linux_amd64.tar.gz | tar -xz
+curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.4.0/poll-ci_v1.4.0_linux_amd64.tar.gz | tar -xz
 sudo install poll-ci /usr/local/bin/
 
 # …or from source:
@@ -614,7 +643,9 @@ docker compose --profile autoupdate up -d
 Watchtower polls the registry hourly and recreates the poll-ci container in place
 when its image digest changes (scoped by label to only touch poll-ci). A new
 image landing mid-check is safe: poll-ci catches SIGTERM, cancels the in-flight
-check, and re-runs that commit after the restart.
+check, and re-runs that commit after the restart. If the branch moved on while
+it was down, the interrupted commit's statuses are resolved at startup
+(`interrupted by restart`) instead of lingering `pending`.
 
 [watchtower]: https://containrrr.dev/watchtower/
 
@@ -642,9 +673,11 @@ A classic token with the **`repo`** scope also works (it's broader than
 needed). Fine for private repos; use the fine-grained token to stay
 least-privilege.
 
-The token is sent as an HTTP auth header for git — it's **never written into
-`.git/config`**, so it can't leak into your check containers — and it's
-scrubbed from logs.
+The token is sent as an HTTP auth header for git, passed via environment
+variables (`GIT_CONFIG_*`, needs git ≥ 2.31 when running the plain binary) so
+it is **invisible in process listings** and **never written into
+`.git/config`** — it can't leak into your check containers — and both the raw
+token and its base64 header form are scrubbed from logs.
 
 ---
 
@@ -696,6 +729,13 @@ docker run --rm -v poll-ci-state:/s alpine rm -f /s/state.json
 **Watch open pull requests too** — set `POLL_PRS=true`. poll-ci will also test
 the head commit of each open PR **whose branch lives in the same repo**. PRs
 from forks are skipped on purpose (see [Security](#security)).
+
+**Startup housekeeping.** On every start poll-ci removes check containers and
+checkout dirs orphaned by a previous crash (scoped by an instance label, so
+co-located poll-ci instances on a shared daemon never touch each other), and
+resolves any statuses a killed run left `pending` on GitHub. Containers from
+pre-v1.4 versions carry only the generic label — prune those once by hand:
+`docker ps -aq -f label=poll-ci | xargs docker rm -f`.
 
 ---
 
@@ -760,7 +800,14 @@ host, or use images from a registry/mirror you control.
 **It only tested the latest commit, skipping ones in between.**
 By design — poll-ci tests the current **HEAD** of each branch per poll. If you
 push 3 commits between polls, it tests the tip. Lower `POLL_INTERVAL` to catch
-more, but it never tests every intermediate commit of a fast push.
+more, but it never tests every intermediate commit of a fast push. Set
+`MARK_SKIPPED=true` to at least stamp the skipped commits with a terminal
+status instead of leaving them blank.
+
+**A commit is stuck on a yellow "pending" status.**
+Shouldn't happen anymore: status posts are retried, and statuses stranded by a
+crash/restart are resolved at the next startup. If you still see one (e.g.
+posted by an old version), re-run the commit with `--once`.
 
 **It re-ran a commit after I recreated the container.**
 You didn't mount the state volume (`-v poll-ci-state:/var/lib/poll-ci`). Without
@@ -778,9 +825,11 @@ Stated plainly, so there are no surprises:
 - **Polling latency.** A push is noticed within `POLL_INTERVAL` seconds, not
   instantly.
 - **Tests HEAD only.** Each poll tests the branch tip; intermediate commits of a
-  multi-commit push aren't individually tested.
-- **Sequential.** Checks and repos run one at a time. No parallelism — per-check
-  `timeout` keeps a stuck check from blocking forever.
+  multi-commit push aren't individually tested (`MARK_SKIPPED` at least makes
+  that visible on each skipped commit).
+- **Sequential checks.** A repo's checks run one at a time — per-check
+  `timeout` keeps a stuck check from blocking forever. Repos are also swept
+  one at a time by default; set `CONCURRENCY=N` to sweep several in parallel.
 - **No caching.** Every run starts clean (Docker *image* layers are still cached
   by the host daemon). Warm dependencies? Bake them into a custom `image:`.
 - **One image per repo**, shared by all its checks.
@@ -812,6 +861,8 @@ brings the container back after a reboot. Already-tested commits aren't re-run.
 **Can I run checks in parallel / cache dependencies?**
 No — both are intentionally left out to keep the tool tiny and predictable. See
 [Limitations](#limitations). Bake heavy dependencies into a custom `image:`.
+(*Repos* can be swept in parallel with `CONCURRENCY` — it's the checks within a
+repo that stay sequential.)
 
 **Does it work with private repos?**
 Yes — give the token access to them.
