@@ -106,15 +106,18 @@ func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 	if r.cfg.ShortCircuit {
 		go r.watchForNewerTip(runCtx, ref, sha, cancel)
 	}
-	passed := r.runCommit(runCtx, ref, sha, dir)
+	passed, completed := r.runCommit(runCtx, ref, sha, dir)
 	cancel(nil) // run finished — stop the watcher
 
-	// Short-circuited: a newer commit superseded this run. runCommit has already
-	// resolved the per-check and ci/trivy contexts to "superseded"; here we resolve
-	// the `ci` rollup, record the SHA so it isn't retried, and signal the caller to
-	// test the newer tip.
+	// Short-circuited: a newer commit superseded this run before it finished.
+	// runCommit has already resolved the per-check and ci/trivy contexts to
+	// "superseded"; here we resolve the `ci` rollup, record the SHA so it isn't
+	// retried, and signal the caller to test the newer tip. A run that COMPLETED
+	// keeps its real results even when the watcher's cancel raced in at the very
+	// end — only the jump to the newer tip is taken from it.
 	var se *supersededError
-	if errors.As(context.Cause(runCtx), &se) {
+	superseded := errors.As(context.Cause(runCtx), &se)
+	if superseded && !completed {
 		log.Printf("[%s] %s %s — abandoning stale run", ref, short(sha), se.Error())
 		r.setStatus(ctx, ref, sha, StateError, "ci", se.Error())
 		if err := r.store.Mark(ref, sha); err != nil {
@@ -134,7 +137,7 @@ func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 			return false, nil
 		}
 	}
-	return false, r.store.Mark(ref, tip, sha)
+	return superseded, r.store.Mark(ref, tip, sha)
 }
 
 // watchForNewerTip polls the branch tip during a run and cancels it (with a
@@ -203,18 +206,22 @@ func (r *Runner) RunOnce(ctx context.Context, ref Ref, sha string) bool {
 		return false
 	}
 	defer os.RemoveAll(dir)
-	return r.runCommit(ctx, ref, sha, dir)
+	passed, _ := r.runCommit(ctx, ref, sha, dir)
+	return passed
 }
 
 // runCommit reads the repo's .poll-ci.yml and runs every check, posting commit
-// statuses throughout. Returns true if all checks passed.
-func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) bool {
+// statuses throughout. passed reports whether all checks passed; completed
+// reports whether the run reached a terminal result (as opposed to being cut
+// short by cancellation) — a completed run's results stand even if a late
+// cancel raced in after the last check finished.
+func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) (passed, completed bool) {
 	rc, err := r.readRepoConfig(dir)
 	if err != nil {
 		// No usable config: report one error status so the commit isn't silently ignored.
 		log.Printf("[%s] %s: %v", ref, short(sha), err)
 		r.setStatus(ctx, ref, sha, StateError, "ci", err.Error())
-		return false
+		return false, true // terminal: the error rollup is this commit's result
 	}
 	image := rc.Image
 	if image == "" {
@@ -275,32 +282,37 @@ func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) bool {
 		}
 	}
 
-	// Short-circuited by a newer commit: terminalize every context we did not
-	// resolve — the in-flight + not-yet-started checks, and the scan if unreached —
-	// so none lingers `pending` on this superseded SHA. Completed checks keep their
-	// real results; processBranchOnce resolves the matching `ci` rollup. (These
-	// posts land despite the now-cancelled ctx because setStatus detaches it.)
+	// A run that resolved every step is complete: its results stand even if a
+	// cancellation raced in between the last step and here.
+	completed = done == len(rc.Checks) && (rc.Scan == nil || scanDone)
+
+	// Short-circuited by a newer commit before finishing: terminalize every
+	// context we did not resolve — the in-flight + not-yet-started checks, and
+	// the scan if unreached — so none lingers `pending` on this superseded SHA.
+	// Completed checks keep their real results; processBranchOnce resolves the
+	// matching `ci` rollup. (These posts land despite the now-cancelled ctx
+	// because setStatus detaches it.)
 	var se *supersededError
-	if errors.As(context.Cause(ctx), &se) {
+	if !completed && errors.As(context.Cause(ctx), &se) {
 		for _, ck := range rc.Checks[done:] {
 			r.setStatus(ctx, ref, sha, StateError, "ci/"+ck.Name, se.Error())
 		}
 		if rc.Scan != nil && !scanDone {
 			r.setStatus(ctx, ref, sha, StateError, "ci/trivy", se.Error())
 		}
-		return false
+		return false, false
 	}
 
-	if ctx.Err() != nil {
-		return false // engine shutdown — leave unresolved contexts pending; the commit re-runs on restart
+	if !completed && ctx.Err() != nil {
+		return false, false // engine shutdown — leave unresolved contexts pending; the commit re-runs on restart
 	}
 
 	if failed == 0 {
 		r.setStatus(ctx, ref, sha, StateSuccess, "ci", fmt.Sprintf("all %d checks passed", total))
-		return true
+		return true, true
 	}
 	r.setStatus(ctx, ref, sha, StateFailure, "ci", fmt.Sprintf("%d of %d checks failed", failed, total))
-	return false
+	return false, true
 }
 
 // runScan runs the configured trivy filesystem scan against the copied-in
