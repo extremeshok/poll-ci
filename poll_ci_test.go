@@ -261,8 +261,26 @@ func TestScrubAndOneLine(t *testing.T) {
 	if got := scrub("nothing", ""); got != "nothing" {
 		t.Errorf("scrub empty token: %q", got)
 	}
+	// Multiple secrets: both the raw token and its base64 header form must go.
+	if got := scrub("raw tok123 and basic dG9rMTIz end", "tok123", "dG9rMTIz"); got != "raw *** and basic *** end" {
+		t.Errorf("scrub multi: %q", got)
+	}
 	if got := oneLine("a\n  b\t c \n"); got != "a b c" {
 		t.Errorf("oneLine: %q", got)
+	}
+}
+
+// NewRunner must register both token forms as secrets — git error output could
+// echo the auth header, whose value is the base64, not the raw token.
+func TestRunnerSecrets(t *testing.T) {
+	r := NewRunner(&RunnerConfig{Token: "tok123"}, nil, nil)
+	b64 := "eC1hY2Nlc3MtdG9rZW46dG9rMTIz" // base64("x-access-token:tok123")
+	if r.authB64 != b64 {
+		t.Errorf("authB64 = %q, want %q", r.authB64, b64)
+	}
+	in := "header AUTHORIZATION: basic " + b64 + " raw tok123"
+	if got := scrub(in, r.secrets...); strings.Contains(got, "tok123") || strings.Contains(got, b64) {
+		t.Errorf("secrets leaked: %q", got)
 	}
 }
 

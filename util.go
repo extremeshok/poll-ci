@@ -98,12 +98,15 @@ func lastLine(s string) string {
 	return ""
 }
 
-// scrub replaces the token with *** so it never lands in a log line.
-func scrub(s, token string) string {
-	if token == "" {
-		return s
+// scrub replaces each secret (the raw token and its base64 header form) with
+// *** so none ever lands in a log line or status description.
+func scrub(s string, secrets ...string) string {
+	for _, sec := range secrets {
+		if sec != "" {
+			s = strings.ReplaceAll(s, sec, "***")
+		}
 	}
-	return strings.ReplaceAll(s, token, "***")
+	return s
 }
 
 // truncate shortens s to at most n runes (GitHub counts characters), adding an

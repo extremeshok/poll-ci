@@ -27,14 +27,21 @@ import (
 
 // Runner ties together config, the GitHub client, and the seen-SHA store.
 type Runner struct {
-	cfg   *RunnerConfig
-	gh    *GitHub
-	store *Store
+	cfg     *RunnerConfig
+	gh      *GitHub
+	store   *Store
+	authB64 string   // base64("x-access-token:" + token), for git's auth header
+	secrets []string // every form of the token that must never reach a log line
 }
 
 // NewRunner constructs a Runner.
 func NewRunner(cfg *RunnerConfig, gh *GitHub, store *Store) *Runner {
-	return &Runner{cfg: cfg, gh: gh, store: store}
+	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + cfg.Token))
+	return &Runner{
+		cfg: cfg, gh: gh, store: store,
+		authB64: auth,
+		secrets: []string{cfg.Token, auth},
+	}
 }
 
 // PollOnce sweeps every watched ref once (and open PRs, if enabled).
@@ -456,7 +463,7 @@ func (r *Runner) runScan(ctx context.Context, image, dir string, sc *Scan) (bool
 
 	cid, err := r.dockerCreateScan(cctx, image, sc.CacheVolume, args)
 	if err != nil {
-		return false, "scan container create failed: " + oneLine(scrub(err.Error(), r.cfg.Token))
+		return false, "scan container create failed: " + oneLine(scrub(err.Error(), r.secrets...))
 	}
 	defer r.dockerRemove(cid)
 
@@ -554,7 +561,7 @@ func (r *Runner) runCheck(ctx context.Context, image, dir string, ck Check) (boo
 
 	cid, err := r.dockerCreate(cctx, image, ck.Run)
 	if err != nil {
-		return false, "container create failed: " + oneLine(scrub(err.Error(), r.cfg.Token))
+		return false, "container create failed: " + oneLine(scrub(err.Error(), r.secrets...))
 	}
 	defer r.dockerRemove(cid)
 
@@ -804,17 +811,9 @@ func (r *Runner) repoURL(ref Ref) string {
 	return fmt.Sprintf("https://%s/%s/%s.git", r.cfg.GitHost, ref.Owner, ref.Name)
 }
 
-// gitArgs prepends an http.extraHeader carrying the token. Because it is passed
-// with -c (not configured), the token is never written to the clone's
-// .git/config — which we later tar into the check container.
-func (r *Runner) gitArgs(extra ...string) []string {
-	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + r.cfg.Token))
-	return append([]string{"-c", "http.extraHeader=AUTHORIZATION: basic " + auth}, extra...)
-}
-
 // gitLsRemote returns the HEAD SHA of the watched branch.
 func (r *Runner) gitLsRemote(ctx context.Context, ref Ref) (string, error) {
-	out, err := r.git(ctx, "", r.gitArgs("ls-remote", r.repoURL(ref), "refs/heads/"+ref.Branch)...)
+	out, err := r.git(ctx, "", "ls-remote", r.repoURL(ref), "refs/heads/"+ref.Branch)
 	if err != nil {
 		return "", err
 	}
@@ -831,7 +830,7 @@ func (r *Runner) cloneBranch(ctx context.Context, ref Ref) (dir, sha string, err
 	if err != nil {
 		return "", "", err
 	}
-	args := r.gitArgs("clone", "--depth", "1", "--single-branch", "--branch", ref.Branch, r.repoURL(ref), dir)
+	args := []string{"clone", "--depth", "1", "--single-branch", "--branch", ref.Branch, r.repoURL(ref), dir}
 	if _, err = r.git(ctx, "", args...); err != nil {
 		os.RemoveAll(dir)
 		return "", "", err
@@ -852,7 +851,7 @@ func (r *Runner) cloneCommit(ctx context.Context, ref Ref, sha string) (string, 
 	}
 	steps := [][]string{
 		{"init", "-q", dir},
-		r.gitArgs("-C", dir, "fetch", "--depth", "1", r.repoURL(ref), sha),
+		{"-C", dir, "fetch", "--depth", "1", r.repoURL(ref), sha},
 		{"-C", dir, "checkout", "-q", "FETCH_HEAD"},
 	}
 	for _, s := range steps {
@@ -864,18 +863,27 @@ func (r *Runner) cloneCommit(ctx context.Context, ref Ref, sha string) (string, 
 	return dir, nil
 }
 
-// git runs a git command, scrubbing the token from any error output. Args are
-// never echoed (they carry the auth header).
+// git runs a git command, scrubbing the token from any error output. The auth
+// header rides in via GIT_CONFIG_* environment variables (equivalent to -c but
+// invisible in process listings — argv is world-readable via ps for the life of
+// every clone). It applies per-invocation only and is never persisted into the
+// clone's .git/config, which we later tar into the check container.
+// GIT_CONFIG_COUNT needs git >= 2.31 (2021).
 func (r *Runner) git(ctx context.Context, workdir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if workdir != "" {
 		cmd.Dir = workdir
 	}
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0") // never hang on a credential prompt
+	cmd.Env = append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0", // never hang on a credential prompt
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=http.extraHeader",
+		"GIT_CONFIG_VALUE_0=AUTHORIZATION: basic "+r.authB64,
+	)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("%v: %s", err, scrub(oneLine(errb.String()), r.cfg.Token))
+		return "", fmt.Errorf("%v: %s", err, scrub(oneLine(errb.String()), r.secrets...))
 	}
 	return strings.TrimSpace(out.String()), nil
 }
