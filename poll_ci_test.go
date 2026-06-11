@@ -439,6 +439,132 @@ func TestSetStatusNoRetryOnPermanent(t *testing.T) {
 	}
 }
 
+// Legacy state files stored {"seen":{"k":true}}; they must load transparently.
+func TestStoreLegacyMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := `{"seen":{"o/n@deadbeef":true,"o/n@cafef00d":true}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := LoadStore(path)
+	if err != nil {
+		t.Fatalf("legacy state should load: %v", err)
+	}
+	ref := Ref{Owner: "o", Name: "n", Branch: "main"}
+	if !s.Has(ref, "deadbeef") || !s.Has(ref, "cafef00d") {
+		t.Fatal("legacy seen entries lost in migration")
+	}
+	// A save must persist the new (timestamped) format and stay loadable.
+	if err := s.Mark(ref, "0011223344"); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s2.Has(ref, "deadbeef") || !s2.Has(ref, "0011223344") {
+		t.Fatal("entries lost across migration round-trip")
+	}
+}
+
+// Pruning drops entries past retention but never a branch's last-tested SHA.
+func TestStorePrune(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := Ref{Owner: "o", Name: "n", Branch: "main"}
+	old := time.Now().Add(-seenRetention - time.Hour).Unix()
+	s.Seen[key(ref, "ancient1")] = old
+	s.Seen[key(ref, "lasttip")] = old
+	s.Last[ref.String()] = "lasttip"
+	if err := s.Mark(ref, "fresh"); err != nil { // triggers save → prune
+		t.Fatal(err)
+	}
+	s2, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.Has(ref, "ancient1") {
+		t.Error("aged-out entry should have been pruned")
+	}
+	if !s2.Has(ref, "lasttip") {
+		t.Error("the branch's last-tested SHA must survive pruning")
+	}
+	if !s2.Has(ref, "fresh") {
+		t.Error("fresh entry lost")
+	}
+}
+
+func TestStoreInFlight(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetInFlight("o/n@main", "abc123"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetInFlight("o/n#7", "def456"); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := LoadStore(path) // must survive a restart
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := s2.InFlightSnapshot()
+	if snap["o/n@main"] != "abc123" || snap["o/n#7"] != "def456" {
+		t.Fatalf("in-flight entries lost: %v", snap)
+	}
+	if err := s2.ClearInFlight("o/n@main"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.ClearInFlight("o/n@main"); err != nil { // idempotent
+		t.Fatal(err)
+	}
+	s3, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap = s3.InFlightSnapshot()
+	if _, ok := snap["o/n@main"]; ok {
+		t.Error("cleared entry persisted")
+	}
+	if snap["o/n#7"] != "def456" {
+		t.Error("unrelated entry lost on clear")
+	}
+}
+
+func TestStoreLastTested(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := Ref{Owner: "o", Name: "n", Branch: "main"}
+	if got := s.LastTested(ref); got != "" {
+		t.Fatalf("fresh store LastTested = %q", got)
+	}
+	if err := s.MarkBranch(ref, "tipsha", "testedsha"); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Has(ref, "tipsha") || !s.Has(ref, "testedsha") {
+		t.Error("MarkBranch must mark both tip and tested SHA")
+	}
+	s2, err := LoadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.LastTested(ref); got != "testedsha" {
+		t.Fatalf("LastTested = %q, want testedsha", got)
+	}
+	// Same repo, different branch: independent baseline.
+	if got := s2.LastTested(Ref{Owner: "o", Name: "n", Branch: "dev"}); got != "" {
+		t.Fatalf("other branch LastTested = %q", got)
+	}
+}
+
 func TestStoreRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	s, err := LoadStore(path)
