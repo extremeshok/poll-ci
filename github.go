@@ -8,9 +8,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -27,6 +29,46 @@ type GitHub struct {
 	token   string
 	apiBase string
 	http    *http.Client
+}
+
+// apiError is a non-2xx GitHub API response. RetryAfter is non-zero when the
+// response carried a Retry-After header (GitHub's secondary rate limiting).
+type apiError struct {
+	Code       int
+	RetryAfter time.Duration
+	Msg        string
+}
+
+func (e *apiError) Error() string { return e.Msg }
+
+// apiErr drains the response body and wraps a non-2xx response as an *apiError.
+func apiErr(resp *http.Response, what string) error {
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	e := &apiError{Code: resp.StatusCode, Msg: fmt.Sprintf("%s: %s: %s", what, resp.Status, bytes.TrimSpace(msg))}
+	if s := resp.Header.Get("Retry-After"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			e.RetryAfter = time.Duration(n) * time.Second
+		}
+	}
+	return e
+}
+
+// retryable reports whether a failed API call is worth retrying, and any
+// server-mandated wait. Transport errors and 5xx are transient; 429 and 403
+// carrying Retry-After are rate limits. Other 4xx (401, 404, 422 — and a bare
+// 403, which means token permissions) are permanent.
+func retryable(err error) (wait time.Duration, ok bool) {
+	var ae *apiError
+	if !errors.As(err, &ae) {
+		return 0, true // transport-level error — transient
+	}
+	switch {
+	case ae.Code >= 500, ae.Code == http.StatusTooManyRequests:
+		return ae.RetryAfter, true
+	case ae.Code == http.StatusForbidden && ae.RetryAfter > 0:
+		return ae.RetryAfter, true
+	}
+	return 0, false
 }
 
 // NewGitHub builds a client. apiBase is https://api.github.com (or a GHES base).
@@ -59,8 +101,7 @@ func (g *GitHub) SetStatus(ctx context.Context, ref Ref, sha, state, statusConte
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("set status %s=%s: %s: %s", statusContext, state, resp.Status, bytes.TrimSpace(msg))
+		return apiErr(resp, fmt.Sprintf("set status %s=%s", statusContext, state))
 	}
 	return nil
 }

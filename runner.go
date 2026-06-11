@@ -468,14 +468,43 @@ func (r *Runner) readRepoConfig(dir string) (*RepoConfig, error) {
 	return nil, fmt.Errorf("no .poll-ci.yml at repo root")
 }
 
-// setStatus posts a status, logging (but not aborting) on failure.
+// setStatus posts a status, retrying transient failures — a dropped POST would
+// otherwise leave that context pending on GitHub forever, even though the run
+// itself succeeded. Permanent failures (token permissions etc.) are logged, not
+// retried, and never abort the run.
 func (r *Runner) setStatus(ctx context.Context, ref Ref, sha, state, sctx, desc string) {
 	// Use a detached context so shutdown still records the final result.
-	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 90*time.Second)
 	defer cancel()
-	if err := r.gh.SetStatus(pctx, ref, sha, state, sctx, desc); err != nil {
-		log.Printf("[%s] %s: status %s=%s failed: %v", ref, short(sha), sctx, state, err)
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err = r.gh.SetStatus(pctx, ref, sha, state, sctx, desc); err == nil {
+			return
+		}
+		if attempt == 3 {
+			break
+		}
+		wait, ok := retryable(err)
+		if !ok {
+			break
+		}
+		if floor := time.Duration(attempt) * 2 * time.Second; wait < floor {
+			wait = floor
+		}
+		if wait > 30*time.Second {
+			wait = 30 * time.Second
+		}
+		log.Printf("[%s] %s: status %s=%s attempt %d failed (retrying in %s): %v", ref, short(sha), sctx, state, attempt, wait, err)
+		timer := time.NewTimer(wait)
+		select {
+		case <-pctx.Done():
+			timer.Stop()
+			log.Printf("[%s] %s: status %s=%s failed: %v", ref, short(sha), sctx, state, err)
+			return
+		case <-timer.C:
+		}
 	}
+	log.Printf("[%s] %s: status %s=%s failed: %v", ref, short(sha), sctx, state, err)
 }
 
 // --- Docker helpers (sibling containers via the host socket) ----------------

@@ -3,8 +3,11 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -323,6 +326,88 @@ func TestReadRepoConfig(t *testing.T) {
 		if len(rc.Checks) != 1 {
 			t.Errorf("%s: got %d checks", name, len(rc.Checks))
 		}
+	}
+}
+
+func TestRetryable(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		wait time.Duration
+		ok   bool
+	}{
+		{"network", errors.New("dial tcp: connection refused"), 0, true},
+		{"500", &apiError{Code: 500}, 0, true},
+		{"502 with retry-after", &apiError{Code: 502, RetryAfter: 5 * time.Second}, 5 * time.Second, true},
+		{"429", &apiError{Code: 429}, 0, true},
+		{"403 secondary limit", &apiError{Code: 403, RetryAfter: 10 * time.Second}, 10 * time.Second, true},
+		{"403 permissions", &apiError{Code: 403}, 0, false},
+		{"401", &apiError{Code: 401}, 0, false},
+		{"404", &apiError{Code: 404}, 0, false},
+		{"422", &apiError{Code: 422}, 0, false},
+	}
+	for _, c := range cases {
+		wait, ok := retryable(c.err)
+		if wait != c.wait || ok != c.ok {
+			t.Errorf("%s: retryable() = (%s, %v), want (%s, %v)", c.name, wait, ok, c.wait, c.ok)
+		}
+	}
+}
+
+func TestSetStatusAPIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"You have exceeded a secondary rate limit"}`))
+	}))
+	defer srv.Close()
+	gh := NewGitHub("tok", srv.URL)
+	err := gh.SetStatus(context.Background(), Ref{Owner: "o", Name: "n"}, "abc", StateSuccess, "ci/test", "ok")
+	var ae *apiError
+	if !errors.As(err, &ae) {
+		t.Fatalf("expected *apiError, got %v", err)
+	}
+	if ae.Code != 403 || ae.RetryAfter != 7*time.Second {
+		t.Errorf("got code=%d retryAfter=%s", ae.Code, ae.RetryAfter)
+	}
+	if !strings.Contains(ae.Error(), "secondary rate limit") {
+		t.Errorf("error should carry the API message: %q", ae.Error())
+	}
+}
+
+// TestSetStatusRetries: a transient 500 must be retried (the production bug:
+// one lost POST left a context pending forever).
+func TestSetStatusRetries(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	r := &Runner{cfg: &RunnerConfig{}, gh: NewGitHub("tok", srv.URL)}
+	r.setStatus(context.Background(), Ref{Owner: "o", Name: "n", Branch: "main"}, "abc", StateSuccess, "ci/test", "ok")
+	if hits != 2 {
+		t.Errorf("expected 2 attempts (one retry), got %d", hits)
+	}
+}
+
+// Permanent failures (bare 403 = token permissions) must NOT be retried.
+func TestSetStatusNoRetryOnPermanent(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"Resource not accessible by personal access token"}`))
+	}))
+	defer srv.Close()
+	r := &Runner{cfg: &RunnerConfig{}, gh: NewGitHub("tok", srv.URL)}
+	r.setStatus(context.Background(), Ref{Owner: "o", Name: "n", Branch: "main"}, "abc", StateSuccess, "ci/test", "ok")
+	if hits != 1 {
+		t.Errorf("expected exactly 1 attempt, got %d", hits)
 	}
 }
 
