@@ -123,7 +123,7 @@ func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil) // leak-safety; the explicit cancel below stops the watcher promptly
 	if r.cfg.ShortCircuit {
-		go r.watchForNewerTip(runCtx, ref, sha, cancel)
+		go r.watchForNewerTip(runCtx, ref, "refs/heads/"+ref.Branch, sha, cancel)
 	}
 	passed, completed := r.runCommit(runCtx, ref, sha, dir)
 	cancel(nil) // run finished — stop the watcher
@@ -191,10 +191,11 @@ func (r *Runner) markSkipped(ctx context.Context, ref Ref, prev, tested string) 
 	}
 }
 
-// watchForNewerTip polls the branch tip during a run and cancels it (with a
-// supersededError cause) the moment the tip differs from the commit under test,
-// letting the engine abandon the stale run and jump to the newest commit.
-func (r *Runner) watchForNewerTip(ctx context.Context, ref Ref, running string, cancel context.CancelCauseFunc) {
+// watchForNewerTip polls a ref (branch head or PR head) during a run and
+// cancels it (with a supersededError cause) the moment the tip differs from
+// the commit under test, letting the engine abandon the stale run and jump to
+// the newest commit.
+func (r *Runner) watchForNewerTip(ctx context.Context, ref Ref, refspec, running string, cancel context.CancelCauseFunc) {
 	ticker := time.NewTicker(r.cfg.PollInterval)
 	defer ticker.Stop()
 	for {
@@ -202,11 +203,11 @@ func (r *Runner) watchForNewerTip(ctx context.Context, ref Ref, running string, 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tip, err := r.gitLsRemote(ctx, ref)
+			tip, err := r.gitLsRemoteRef(ctx, ref, refspec)
 			if err != nil || tip == "" || tip == running {
 				continue // transient error, or tip unchanged — keep running
 			}
-			log.Printf("[%s] newer commit %s arrived during run of %s — short-circuiting", ref, short(tip), short(running))
+			log.Printf("[%s] newer commit %s on %s during run of %s — short-circuiting", ref.Repo(), short(tip), refspec, short(running))
 			cancel(&supersededError{by: short(tip)})
 			return
 		}
@@ -240,8 +241,24 @@ func (r *Runner) processPRs(ctx context.Context, ref Ref) error {
 		if err := r.store.SetInFlight(k, pr.HeadSHA); err != nil {
 			log.Printf("[%s] state: %v", ref.Repo(), err)
 		}
-		r.runCommit(ctx, ref, pr.HeadSHA, dir)
+
+		// Same short-circuit treatment as branches: a force-push to the PR head
+		// mid-run aborts the stale run instead of wasting the rest of it.
+		runCtx, cancel := context.WithCancelCause(ctx)
+		if r.cfg.ShortCircuit {
+			go r.watchForNewerTip(runCtx, ref, fmt.Sprintf("refs/pull/%d/head", pr.Number), pr.HeadSHA, cancel)
+		}
+		_, completed := r.runCommit(runCtx, ref, pr.HeadSHA, dir)
+		cancel(nil) // run finished — stop the watcher
 		os.RemoveAll(dir)
+
+		var se *supersededError
+		if !completed && errors.As(context.Cause(runCtx), &se) {
+			log.Printf("[%s] PR #%d %s %s — abandoning stale run", ref.Repo(), pr.Number, short(pr.HeadSHA), se.Error())
+			r.setStatus(ctx, ref, pr.HeadSHA, StateError, "ci", se.Error())
+			r.clearInFlight(k) // not marked seen: a force-push back re-runs it
+			continue           // the new head is picked up on the next sweep
+		}
 		if ctx.Err() != nil {
 			return nil // shutting down — leave unmarked (and in-flight) so the restart resolves it
 		}
@@ -897,13 +914,19 @@ func (r *Runner) repoURL(ref Ref) string {
 
 // gitLsRemote returns the HEAD SHA of the watched branch.
 func (r *Runner) gitLsRemote(ctx context.Context, ref Ref) (string, error) {
-	out, err := r.git(ctx, "", "ls-remote", r.repoURL(ref), "refs/heads/"+ref.Branch)
+	return r.gitLsRemoteRef(ctx, ref, "refs/heads/"+ref.Branch)
+}
+
+// gitLsRemoteRef returns the SHA an arbitrary refspec points at — branch heads
+// (refs/heads/x) and PR heads (refs/pull/N/head, which GitHub advertises).
+func (r *Runner) gitLsRemoteRef(ctx context.Context, ref Ref, refspec string) (string, error) {
+	out, err := r.git(ctx, "", "ls-remote", r.repoURL(ref), refspec)
 	if err != nil {
 		return "", err
 	}
 	fields := strings.Fields(out)
 	if len(fields) == 0 {
-		return "", fmt.Errorf("branch %q not found", ref.Branch)
+		return "", fmt.Errorf("ref %q not found", refspec)
 	}
 	return fields[0], nil
 }
