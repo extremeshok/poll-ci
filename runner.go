@@ -111,18 +111,17 @@ func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 
 	// Short-circuited: a newer commit superseded this run before it finished.
 	// runCommit has already resolved the per-check and ci/trivy contexts to
-	// "superseded"; here we resolve the `ci` rollup, record the SHA so it isn't
-	// retried, and signal the caller to test the newer tip. A run that COMPLETED
-	// keeps its real results even when the watcher's cancel raced in at the very
-	// end — only the jump to the newer tip is taken from it.
+	// "superseded"; here we resolve the `ci` rollup and signal the caller to
+	// test the newer tip. The SHA is deliberately NOT marked processed: it is
+	// only ever revisited if the branch tip returns to it (a force-push revert),
+	// and then it should re-run for real instead of staying "superseded" forever.
+	// A run that COMPLETED keeps its real results even when the watcher's cancel
+	// raced in at the very end — only the jump to the newer tip is taken from it.
 	var se *supersededError
 	superseded := errors.As(context.Cause(runCtx), &se)
 	if superseded && !completed {
 		log.Printf("[%s] %s %s — abandoning stale run", ref, short(sha), se.Error())
 		r.setStatus(ctx, ref, sha, StateError, "ci", se.Error())
-		if err := r.store.Mark(ref, sha); err != nil {
-			log.Printf("[%s] state: %v", ref, err)
-		}
 		return true, nil
 	}
 
