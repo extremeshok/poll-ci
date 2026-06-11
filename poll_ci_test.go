@@ -329,6 +329,34 @@ func TestReadRepoConfig(t *testing.T) {
 	}
 }
 
+func TestParseContainerState(t *testing.T) {
+	cases := []struct {
+		in     string
+		status string
+		code   int
+		ok     bool
+	}{
+		{"exited 0\n", "exited", 0, true},
+		{"exited 1", "exited", 1, true},
+		{"running 0", "running", 0, true},
+		{"created 0", "created", 0, true},
+		{"dead 137", "dead", 137, true},
+		{"", "", 0, false},
+		{"exited", "", 0, false},
+		{"exited x", "", 0, false},
+		{"a b c", "", 0, false},
+	}
+	for _, c := range cases {
+		status, code, err := parseContainerState(c.in)
+		if c.ok && (err != nil || status != c.status || code != c.code) {
+			t.Errorf("parseContainerState(%q) = (%q, %d, %v), want (%q, %d, nil)", c.in, status, code, err, c.status, c.code)
+		}
+		if !c.ok && err == nil {
+			t.Errorf("parseContainerState(%q) expected error", c.in)
+		}
+	}
+}
+
 func TestRetryable(t *testing.T) {
 	cases := []struct {
 		name string

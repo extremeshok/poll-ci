@@ -342,14 +342,24 @@ func (r *Runner) runScan(ctx context.Context, image, dir string, sc *Scan) (bool
 		return false, "copy sources failed: " + oneLine(err.Error())
 	}
 
-	r.dockerStart(cctx, cid) // streams trivy's report to the logs; blocks until exit
+	_, _, startErr := r.dockerStart(cctx, cid) // streams trivy's report to the logs; blocks until exit
 	if cctx.Err() == context.DeadlineExceeded {
 		return false, fmt.Sprintf("timed out after %s", timeout)
 	}
 	if ctx.Err() != nil {
 		return false, "cancelled"
 	}
-	return scanResult(r.dockerExitCode(cid), sc.Severity, time.Since(start).Round(time.Second))
+	code, err := r.dockerOutcome(cctx, cid, startErr)
+	if cctx.Err() == context.DeadlineExceeded {
+		return false, fmt.Sprintf("timed out after %s", timeout)
+	}
+	if ctx.Err() != nil {
+		return false, "cancelled"
+	}
+	if err != nil {
+		return false, "could not determine result: " + oneLine(err.Error())
+	}
+	return scanResult(code, sc.Severity, time.Since(start).Round(time.Second))
 }
 
 // scanResult maps a trivy exit code to (passed, one-line description). trivy
@@ -430,7 +440,7 @@ func (r *Runner) runCheck(ctx context.Context, image, dir string, ck Check) (boo
 		return false, "copy sources failed: " + oneLine(err.Error())
 	}
 
-	stdout, stderr := r.dockerStart(cctx, cid)
+	stdout, stderr, startErr := r.dockerStart(cctx, cid)
 	if cctx.Err() == context.DeadlineExceeded {
 		return false, fmt.Sprintf("timed out after %s", timeout)
 	}
@@ -438,7 +448,16 @@ func (r *Runner) runCheck(ctx context.Context, image, dir string, ck Check) (boo
 		return false, "cancelled"
 	}
 
-	code := r.dockerExitCode(cid)
+	code, err := r.dockerOutcome(cctx, cid, startErr)
+	if cctx.Err() == context.DeadlineExceeded {
+		return false, fmt.Sprintf("timed out after %s", timeout)
+	}
+	if ctx.Err() != nil {
+		return false, "cancelled"
+	}
+	if err != nil {
+		return false, "could not determine result: " + oneLine(err.Error())
+	}
 	dur := time.Since(start).Round(time.Second)
 	if code == 0 {
 		return true, "passed in " + dur.String()
@@ -579,28 +598,67 @@ func (r *Runner) dockerCopyIn(ctx context.Context, dir, cid string) error {
 
 // dockerStart starts + attaches the container, streaming output live to stdout
 // while keeping the tail of each stream separately for the status description.
-func (r *Runner) dockerStart(ctx context.Context, cid string) (stdout, stderr string) {
+// startErr is the CLI's own error: a non-zero check exit also surfaces here, so
+// it is only meaningful when the container never left the created state.
+func (r *Runner) dockerStart(ctx context.Context, cid string) (stdout, stderr string, startErr error) {
 	so := &tailBuffer{max: 64 << 10}
 	se := &tailBuffer{max: 64 << 10}
 	cmd := exec.CommandContext(ctx, r.cfg.DockerBin, "start", "-a", cid)
 	cmd.Stdout = io.MultiWriter(so, os.Stdout)
 	cmd.Stderr = io.MultiWriter(se, os.Stdout)
-	_ = cmd.Run() // a non-zero check exit is expected; the real code comes from inspect
-	return so.String(), se.String()
+	startErr = cmd.Run() // the real outcome comes from dockerOutcome
+	return so.String(), se.String(), startErr
 }
 
-// dockerExitCode reads the container's exit code. Detached context so it still
-// works after a per-check timeout cancelled the parent context.
-func (r *Runner) dockerExitCode(cid string) int {
-	out, _, err := r.dockerRun(context.Background(), "inspect", "-f", "{{.State.ExitCode}}", cid)
+// dockerOutcome determines a finished check's exit code robustly. `docker start
+// -a` returning is no guarantee the container exited: the attach stream can
+// break while the check is still running, and a RUNNING container's inspect
+// reports ExitCode 0 — which a naive read would score as a pass (and promote
+// untested code). So: inspect the state; trust the code only once the container
+// actually exited; if it is still running, block on `docker wait` under the
+// check's remaining timeout; and if it never started, fail with the CLI error.
+func (r *Runner) dockerOutcome(ctx context.Context, cid string, startErr error) (int, error) {
+	// Detached inspect so the state is still readable after a per-check timeout.
+	ictx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, _, err := r.dockerRun(ictx, "inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", cid)
 	if err != nil {
-		return -1
+		return -1, fmt.Errorf("inspect: %v", err)
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(out))
+	status, code, err := parseContainerState(out)
 	if err != nil {
-		return -1
+		return -1, err
 	}
-	return n
+	switch status {
+	case "exited", "dead":
+		return code, nil
+	case "created":
+		return -1, fmt.Errorf("container never started: %v", startErr)
+	}
+	// Still running — the attach broke under us. Wait out the real exit under
+	// ctx (the per-check timeout); the caller maps ctx expiry to its timeout path.
+	wout, werr, err := r.dockerRun(ctx, "wait", cid)
+	if err != nil {
+		return -1, fmt.Errorf("wait: %v: %s", err, oneLine(werr))
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(wout))
+	if err != nil {
+		return -1, fmt.Errorf("wait: unexpected output %q", strings.TrimSpace(wout))
+	}
+	return n, nil
+}
+
+// parseContainerState parses `docker inspect -f "{{.State.Status}} {{.State.ExitCode}}"`.
+func parseContainerState(s string) (status string, code int, err error) {
+	fields := strings.Fields(s)
+	if len(fields) != 2 {
+		return "", 0, fmt.Errorf("unexpected inspect output %q", strings.TrimSpace(s))
+	}
+	code, err = strconv.Atoi(fields[1])
+	if err != nil {
+		return "", 0, fmt.Errorf("unexpected inspect output %q", strings.TrimSpace(s))
+	}
+	return fields[0], code, nil
 }
 
 // dockerRemove force-removes the container (kills it if still running).
