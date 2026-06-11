@@ -65,6 +65,9 @@ func main() {
 		log.Printf("also polling open same-repo PR heads")
 	}
 
+	// Resolve statuses leaked by a previous process that died mid-run.
+	runner.reconcileInFlight(ctx)
+
 	// Poll loop: sweep all refs, then wait POLL_INTERVAL (or exit on signal).
 	for {
 		runner.PollOnce(ctx)

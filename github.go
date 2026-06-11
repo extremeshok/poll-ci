@@ -106,6 +106,53 @@ func (g *GitHub) SetStatus(ctx context.Context, ref Ref, sha, state, statusConte
 	return nil
 }
 
+// Status is a commit status (the latest per context, after ListStatuses dedupes).
+type Status struct {
+	Context string `json:"context"`
+	State   string `json:"state"`
+}
+
+// ListStatuses returns the latest status per context for a SHA. The endpoint
+// lists every historical status newest-first, paginated; three pages is far
+// beyond any sane number of contexts.
+func (g *GitHub) ListStatuses(ctx context.Context, ref Ref, sha string) ([]Status, error) {
+	seen := map[string]bool{}
+	var out []Status
+	for page := 1; page <= 3; page++ {
+		url := fmt.Sprintf("%s/repos/%s/%s/commits/%s/statuses?per_page=100&page=%d", g.apiBase, ref.Owner, ref.Name, sha, page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		g.setHeaders(req)
+		resp, err := g.http.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			err := apiErr(resp, "list statuses")
+			resp.Body.Close()
+			return nil, err
+		}
+		var raw []Status
+		err = json.NewDecoder(resp.Body).Decode(&raw)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, st := range raw {
+			if !seen[st.Context] {
+				seen[st.Context] = true
+				out = append(out, st)
+			}
+		}
+		if len(raw) < 100 {
+			break
+		}
+	}
+	return out, nil
+}
+
 // PR is the subset of an open pull request we care about.
 type PR struct {
 	Number   int

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -562,6 +563,46 @@ func TestStoreLastTested(t *testing.T) {
 	// Same repo, different branch: independent baseline.
 	if got := s2.LastTested(Ref{Owner: "o", Name: "n", Branch: "dev"}); got != "" {
 		t.Fatalf("other branch LastTested = %q", got)
+	}
+}
+
+// ListStatuses must paginate and keep only the newest status per context.
+func TestListStatuses(t *testing.T) {
+	page1 := make([]map[string]string, 0, 100)
+	page1 = append(page1, map[string]string{"context": "ci/a", "state": "success"}) // newest ci/a
+	for i := 0; i < 99; i++ {
+		page1 = append(page1, map[string]string{"context": "ci/fill" + string(rune('A'+i%26)) + string(rune('0'+i%10)), "state": "pending"})
+	}
+	page2 := []map[string]string{
+		{"context": "ci/a", "state": "pending"}, // older duplicate — must lose
+		{"context": "ci/b", "state": "pending"},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Query().Get("page") {
+		case "1":
+			json.NewEncoder(w).Encode(page1)
+		case "2":
+			json.NewEncoder(w).Encode(page2)
+		default:
+			json.NewEncoder(w).Encode([]map[string]string{})
+		}
+	}))
+	defer srv.Close()
+	gh := NewGitHub("tok", srv.URL)
+	got, err := gh.ListStatuses(context.Background(), Ref{Owner: "o", Name: "n"}, "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := map[string]string{}
+	for _, st := range got {
+		states[st.Context] = st.State
+	}
+	if states["ci/a"] != "success" {
+		t.Errorf("ci/a should keep its newest (success) status, got %q", states["ci/a"])
+	}
+	if states["ci/b"] != "pending" {
+		t.Errorf("ci/b missing from page 2: %v", states["ci/b"])
 	}
 }
 

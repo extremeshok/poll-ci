@@ -100,6 +100,11 @@ func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 		return false, r.store.Mark(ref, tip)
 	}
 
+	// Record the run as in-flight so a crash/restart can reconcile its statuses.
+	if err := r.store.SetInFlight(ref.String(), sha); err != nil {
+		log.Printf("[%s] state: %v", ref, err)
+	}
+
 	// Run under a cancellable context; a watcher aborts it if a newer tip lands.
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil) // leak-safety; the explicit cancel below stops the watcher promptly
@@ -122,11 +127,14 @@ func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 	if superseded && !completed {
 		log.Printf("[%s] %s %s — abandoning stale run", ref, short(sha), se.Error())
 		r.setStatus(ctx, ref, sha, StateError, "ci", se.Error())
+		r.clearInFlight(ref.String()) // every context is terminal now
 		return true, nil
 	}
 
 	if ctx.Err() != nil {
-		return false, nil // engine shutdown — leave unmarked so it retries on restart
+		// Engine shutdown — leave unmarked (and in-flight) so the restart either
+		// re-runs it (still the tip) or reconciles its statuses (tip moved on).
+		return false, nil
 	}
 	if passed {
 		r.maybePromote(ctx, ref, sha, dir)
@@ -136,7 +144,9 @@ func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 			return false, nil
 		}
 	}
-	return superseded, r.store.Mark(ref, tip, sha)
+	err = r.store.MarkBranch(ref, tip, sha)
+	r.clearInFlight(ref.String())
+	return superseded, err
 }
 
 // watchForNewerTip polls the branch tip during a run and cancels it (with a
@@ -184,16 +194,89 @@ func (r *Runner) processPRs(ctx context.Context, ref Ref) error {
 			log.Printf("[%s] PR #%d clone: %v", ref.Repo(), pr.Number, err)
 			continue
 		}
+		k := prKey(ref, pr.Number)
+		if err := r.store.SetInFlight(k, pr.HeadSHA); err != nil {
+			log.Printf("[%s] state: %v", ref.Repo(), err)
+		}
 		r.runCommit(ctx, ref, pr.HeadSHA, dir)
 		os.RemoveAll(dir)
 		if ctx.Err() != nil {
-			return nil // shutting down — leave unmarked so it retries on restart
+			return nil // shutting down — leave unmarked (and in-flight) so the restart resolves it
 		}
 		if err := r.store.Mark(ref, pr.HeadSHA); err != nil {
 			log.Printf("[%s] state: %v", ref.Repo(), err)
 		}
+		r.clearInFlight(k)
 	}
 	return nil
+}
+
+// prKey is the in-flight key for a PR run.
+func prKey(ref Ref, n int) string { return ref.Repo() + "#" + strconv.Itoa(n) }
+
+// clearInFlight clears a resolved run, logging (not propagating) save errors.
+func (r *Runner) clearInFlight(k string) {
+	if err := r.store.ClearInFlight(k); err != nil {
+		log.Printf("state: %v", err)
+	}
+}
+
+// reconcileInFlight terminalizes statuses leaked by a previous process that
+// died mid-run. A killed run leaves its commit unmarked so it re-runs — but if
+// the branch moved on before the restart, the old SHA is never revisited and
+// its pending contexts would stay yellow on GitHub forever. For each recorded
+// in-flight run: if its SHA is still the branch tip, just clear the marker (the
+// normal poll re-runs it); otherwise resolve every still-pending context as an
+// error. Called once at startup, before the poll loop.
+func (r *Runner) reconcileInFlight(ctx context.Context) {
+	for k, sha := range r.store.InFlightSnapshot() {
+		if ctx.Err() != nil {
+			return
+		}
+		ref, ok := r.refForKey(k)
+		if !ok {
+			r.clearInFlight(k) // the watched set changed; we can no longer attribute the run
+			continue
+		}
+		desc := "interrupted by restart; run superseded"
+		if k == ref.String() { // branch run — is it still the tip?
+			tip, err := r.gitLsRemote(ctx, ref)
+			if err == nil && tip == sha {
+				r.clearInFlight(k) // still the tip — the normal poll re-runs it
+				continue
+			}
+			if err == nil {
+				desc = "interrupted by restart; superseded by " + short(tip)
+			}
+		}
+		statuses, err := r.gh.ListStatuses(ctx, ref, sha)
+		if err != nil {
+			log.Printf("[%s] reconcile %s: %v", ref.Repo(), short(sha), err)
+			continue // keep the marker; retried on the next start
+		}
+		n := 0
+		for _, st := range statuses {
+			if st.State == StatePending {
+				r.setStatus(ctx, ref, sha, StateError, st.Context, desc)
+				n++
+			}
+		}
+		if n > 0 {
+			log.Printf("[%s] reconciled %d leaked pending status(es) on %s", ref.Repo(), n, short(sha))
+		}
+		r.clearInFlight(k)
+	}
+}
+
+// refForKey resolves an in-flight key ("owner/name@branch" or "owner/name#pr")
+// back to its watched ref.
+func (r *Runner) refForKey(k string) (Ref, bool) {
+	for _, ref := range r.cfg.Refs {
+		if k == ref.String() || strings.HasPrefix(k, ref.Repo()+"#") {
+			return ref, true
+		}
+	}
+	return Ref{}, false
 }
 
 // RunOnce processes a single SHA without consulting or updating state — for the
