@@ -30,8 +30,9 @@ type Runner struct {
 	cfg     *RunnerConfig
 	gh      *GitHub
 	store   *Store
-	authB64 string   // base64("x-access-token:" + token), for git's auth header
-	secrets []string // every form of the token that must never reach a log line
+	authB64  string   // base64("x-access-token:" + token), for git's auth header
+	secrets  []string // every form of the token that must never reach a log line
+	instance string   // label value scoping this instance's containers for the orphan sweep
 }
 
 // NewRunner constructs a Runner.
@@ -39,8 +40,9 @@ func NewRunner(cfg *RunnerConfig, gh *GitHub, store *Store) *Runner {
 	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + cfg.Token))
 	return &Runner{
 		cfg: cfg, gh: gh, store: store,
-		authB64: auth,
-		secrets: []string{cfg.Token, auth},
+		authB64:  auth,
+		secrets:  []string{cfg.Token, auth},
+		instance: instanceID(cfg.StateFile),
 	}
 }
 
@@ -676,11 +678,45 @@ func (r *Runner) ensureImage(ctx context.Context, image string) {
 
 // dockerCreate creates (but does not start) a container that runs the check.
 func (r *Runner) dockerCreate(ctx context.Context, image, run string) (string, error) {
-	out, errb, err := r.dockerRun(ctx, "create", "--label", "poll-ci", "-w", "/repo", image, "sh", "-ec", run)
+	args := append([]string{"create"}, r.labelArgs()...)
+	args = append(args, "-w", "/repo", image, "sh", "-ec", run)
+	out, errb, err := r.dockerRun(ctx, args...)
 	if err != nil {
 		return "", fmt.Errorf("%v: %s", err, oneLine(errb))
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// labelArgs tags check containers: the generic poll-ci label plus an
+// instance-scoped one the startup orphan sweep filters on.
+func (r *Runner) labelArgs() []string {
+	return []string{"--label", "poll-ci", "--label", "poll-ci.instance=" + r.instance}
+}
+
+// sweepOrphans removes containers and checkout dirs left behind by a previous
+// process that died between create and its deferred cleanup (kill -9, OOM).
+// Runs once at startup, before any checkout exists, so everything matching is
+// guaranteed stale. Only this instance's label is swept — co-located instances
+// sharing a daemon are untouched.
+func (r *Runner) sweepOrphans(ctx context.Context) {
+	out, _, err := r.dockerRun(ctx, "ps", "-aq", "--filter", "label=poll-ci.instance="+r.instance)
+	if err == nil {
+		for _, cid := range strings.Fields(out) {
+			log.Printf("removing orphaned check container %s", cid)
+			r.dockerRemove(cid)
+		}
+	}
+	entries, err := os.ReadDir(r.cfg.WorkDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "co-") {
+			p := filepath.Join(r.cfg.WorkDir, e.Name())
+			log.Printf("removing stale checkout %s", p)
+			os.RemoveAll(p)
+		}
+	}
 }
 
 // dockerCreateScan creates (but does not start) the trivy scan container. Unlike
@@ -689,10 +725,9 @@ func (r *Runner) dockerCreate(ctx context.Context, image, run string) (string, e
 // shell parses user-supplied scanners/severity/path). A named volume is mounted
 // as the trivy cache to persist the vulnerability DB across runs.
 func (r *Runner) dockerCreateScan(ctx context.Context, image, cacheVolume string, trivyArgs []string) (string, error) {
-	args := append([]string{
-		"create", "--label", "poll-ci", "-w", "/repo",
-		"-v", cacheVolume + ":/trivy-cache", image,
-	}, trivyArgs...)
+	args := append([]string{"create"}, r.labelArgs()...)
+	args = append(args, "-w", "/repo", "-v", cacheVolume+":/trivy-cache", image)
+	args = append(args, trivyArgs...)
 	out, errb, err := r.dockerRun(ctx, args...)
 	if err != nil {
 		return "", fmt.Errorf("%v: %s", err, oneLine(errb))

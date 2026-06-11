@@ -65,7 +65,9 @@ func main() {
 		log.Printf("also polling open same-repo PR heads")
 	}
 
-	// Resolve statuses leaked by a previous process that died mid-run.
+	// Clean up after any previous process that died mid-run: stale containers
+	// and checkouts first, then statuses it left pending on GitHub.
+	runner.sweepOrphans(ctx)
 	runner.reconcileInFlight(ctx)
 
 	// Poll loop: sweep all refs, then wait POLL_INTERVAL (or exit on signal).

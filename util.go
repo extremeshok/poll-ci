@@ -5,6 +5,8 @@ package main
 
 import (
 	"archive/tar"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
@@ -75,6 +77,14 @@ func (t *tailBuffer) Write(p []byte) (int, error) {
 }
 
 func (t *tailBuffer) String() string { return string(t.buf) }
+
+// instanceID derives a stable per-instance tag from the state file path, so
+// containers can be labeled and swept at startup without ever touching a
+// co-located poll-ci instance's containers on a shared Docker daemon.
+func instanceID(stateFile string) string {
+	sum := sha256.Sum256([]byte(stateFile))
+	return hex.EncodeToString(sum[:4])
+}
 
 // short abbreviates a SHA to 7 characters for logging.
 func short(sha string) string {

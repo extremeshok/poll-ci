@@ -270,6 +270,19 @@ func TestScrubAndOneLine(t *testing.T) {
 	}
 }
 
+func TestInstanceID(t *testing.T) {
+	a, b := instanceID("/var/lib/poll-ci/state.json"), instanceID("/tmp/other/state.json")
+	if len(a) != 8 || len(b) != 8 {
+		t.Errorf("instanceID should be 8 hex chars, got %q, %q", a, b)
+	}
+	if a == b {
+		t.Error("distinct state files must yield distinct instance ids")
+	}
+	if a != instanceID("/var/lib/poll-ci/state.json") {
+		t.Error("instanceID must be stable across restarts")
+	}
+}
+
 // NewRunner must register both token forms as secrets — git error output could
 // echo the auth header, whose value is the base64, not the raw token.
 func TestRunnerSecrets(t *testing.T) {
