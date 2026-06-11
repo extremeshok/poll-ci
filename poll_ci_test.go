@@ -204,6 +204,74 @@ func TestParseRepoConfigScan(t *testing.T) {
 			t.Errorf("expected error for unsafe scan value: %q", in)
 		}
 	}
+
+	// Path traversal in scan.path is rejected (".." passes safeArg's charset).
+	for _, in := range []string{
+		"checks:\n  - name: t\n    run: x\nscan:\n  path: web/../../etc\n",
+		"checks:\n  - name: t\n    run: x\nscan:\n  path: a/..\n",
+	} {
+		if _, err := parseRepoConfig([]byte(in)); err == nil {
+			t.Errorf("expected error for traversing scan.path: %q", in)
+		}
+	}
+	// A harmless dotted path element still parses.
+	if _, err := parseRepoConfig([]byte("checks:\n  - name: t\n    run: x\nscan:\n  path: web/v1.2\n")); err != nil {
+		t.Errorf("dotted scan.path should parse: %v", err)
+	}
+}
+
+func TestSecondsOrInvalid(t *testing.T) {
+	const k = "POLLCI_TEST_SECONDS"
+	for _, bad := range []string{"5m", "0", "-3", "abc"} {
+		t.Setenv(k, bad)
+		if got := secondsOr(k, 60); got != 60*time.Second {
+			t.Errorf("%q: got %s, want fallback 60s", bad, got)
+		}
+	}
+	t.Setenv(k, "90")
+	if got := secondsOr(k, 60); got != 90*time.Second {
+		t.Errorf("valid: got %s", got)
+	}
+}
+
+// ListOpenPRs must walk pages, not stop at the first 100.
+func TestListOpenPRsPagination(t *testing.T) {
+	mk := func(n int) map[string]any {
+		return map[string]any{
+			"number": n,
+			"head": map[string]any{
+				"sha":  fmt.Sprintf("sha%d", n),
+				"repo": map[string]any{"full_name": "o/n"},
+			},
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Query().Get("page") {
+		case "1":
+			page := make([]map[string]any, 100)
+			for i := range page {
+				page[i] = mk(i + 1)
+			}
+			json.NewEncoder(w).Encode(page)
+		case "2":
+			json.NewEncoder(w).Encode([]map[string]any{mk(101)})
+		default:
+			json.NewEncoder(w).Encode([]map[string]any{})
+		}
+	}))
+	defer srv.Close()
+	gh := NewGitHub("tok", srv.URL)
+	prs, err := gh.ListOpenPRs(context.Background(), Ref{Owner: "o", Name: "n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prs) != 101 {
+		t.Fatalf("got %d PRs, want 101", len(prs))
+	}
+	if prs[100].Number != 101 || prs[100].HeadSHA != "sha101" || prs[100].HeadRepo != "o/n" {
+		t.Errorf("page-2 PR mangled: %+v", prs[100])
+	}
 }
 
 func TestSafeArg(t *testing.T) {

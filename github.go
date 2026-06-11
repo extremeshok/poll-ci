@@ -160,40 +160,48 @@ type PR struct {
 	HeadRepo string // "owner/name" of the head; empty for deleted forks
 }
 
-// ListOpenPRs returns open pull requests for a repo (first page, up to 100).
+// ListOpenPRs returns open pull requests for a repo, paginated (capped at 10
+// pages / 1000 PRs — far beyond any repo poll-ci should be watching).
 func (g *GitHub) ListOpenPRs(ctx context.Context, ref Ref) ([]PR, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/pulls?state=open&per_page=100", g.apiBase, ref.Owner, ref.Name)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	g.setHeaders(req)
+	var prs []PR
+	for page := 1; page <= 10; page++ {
+		url := fmt.Sprintf("%s/repos/%s/%s/pulls?state=open&per_page=100&page=%d", g.apiBase, ref.Owner, ref.Name, page)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		g.setHeaders(req)
 
-	resp, err := g.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return nil, fmt.Errorf("list PRs: %s: %s", resp.Status, bytes.TrimSpace(msg))
-	}
+		resp, err := g.http.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			err := apiErr(resp, "list PRs")
+			resp.Body.Close()
+			return nil, err
+		}
 
-	var raw []struct {
-		Number int `json:"number"`
-		Head   struct {
-			SHA  string `json:"sha"`
-			Repo struct {
-				FullName string `json:"full_name"`
-			} `json:"repo"`
-		} `json:"head"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, err
-	}
-	prs := make([]PR, 0, len(raw))
-	for _, r := range raw {
-		prs = append(prs, PR{Number: r.Number, HeadSHA: r.Head.SHA, HeadRepo: r.Head.Repo.FullName})
+		var raw []struct {
+			Number int `json:"number"`
+			Head   struct {
+				SHA  string `json:"sha"`
+				Repo struct {
+					FullName string `json:"full_name"`
+				} `json:"repo"`
+			} `json:"head"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&raw)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range raw {
+			prs = append(prs, PR{Number: r.Number, HeadSHA: r.Head.SHA, HeadRepo: r.Head.Repo.FullName})
+		}
+		if len(raw) < 100 {
+			break
+		}
 	}
 	return prs, nil
 }

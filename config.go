@@ -281,6 +281,13 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 		if s.Timeout < 0 {
 			return nil, fmt.Errorf("scan.timeout must be >= 0")
 		}
+		// safeArg's charset admits ".", so ".." would pass it — reject any
+		// dot-dot element explicitly to keep the scan target inside the repo.
+		for _, el := range strings.Split(s.Path, "/") {
+			if el == ".." {
+				return nil, fmt.Errorf("scan.path must stay inside the repo: %q", s.Path)
+			}
+		}
 	}
 	return &rc, nil
 }
@@ -327,13 +334,19 @@ func envOr(key, def string) string {
 	return def
 }
 
+// secondsOr reads a positive-seconds env var, warning (and falling back to
+// def) on anything unparseable rather than silently ignoring it.
 func secondsOr(key string, def int) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return time.Duration(n) * time.Second
-		}
+	v := os.Getenv(key)
+	if v == "" {
+		return time.Duration(def) * time.Second
 	}
-	return time.Duration(def) * time.Second
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		log.Printf("config: ignoring invalid %s=%q (want positive seconds); using %ds", key, v, def)
+		return time.Duration(def) * time.Second
+	}
+	return time.Duration(n) * time.Second
 }
 
 // intEnv reads a non-negative integer env var, warning (and falling back to
