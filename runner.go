@@ -51,19 +51,49 @@ func NewRunner(cfg *RunnerConfig, gh *GitHub, store *Store) *Runner {
 	}
 }
 
-// PollOnce sweeps every watched ref once (and open PRs, if enabled).
+// PollOnce sweeps every watched ref once (and open PRs, if enabled). With
+// CONCURRENCY > 1, refs are swept in parallel by a bounded worker pool so one
+// repo's long gate doesn't delay every other repo's polling; refs are
+// independent (per-ref state keys, mutexed store, per-call docker/git
+// processes), and log lines are already [owner/name@branch]-prefixed.
 func (r *Runner) PollOnce(ctx context.Context) {
+	if r.cfg.Concurrency <= 1 || len(r.cfg.Refs) <= 1 {
+		for _, ref := range r.cfg.Refs {
+			if ctx.Err() != nil {
+				return
+			}
+			r.pollRef(ctx, ref)
+		}
+		return
+	}
+	sem := make(chan struct{}, r.cfg.Concurrency)
+	var wg sync.WaitGroup
 	for _, ref := range r.cfg.Refs {
 		if ctx.Err() != nil {
-			return
+			break
 		}
-		if err := r.processBranch(ctx, ref); err != nil {
-			log.Printf("[%s] %v", ref, err)
-		}
-		if r.cfg.PollPRs {
-			if err := r.processPRs(ctx, ref); err != nil {
-				log.Printf("[%s] pulls: %v", ref.Repo(), err)
-			}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ref Ref) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			r.pollRef(ctx, ref)
+		}(ref)
+	}
+	wg.Wait()
+}
+
+// pollRef sweeps one ref: its branch, then (optionally) its open PRs.
+func (r *Runner) pollRef(ctx context.Context, ref Ref) {
+	if ctx.Err() != nil {
+		return
+	}
+	if err := r.processBranch(ctx, ref); err != nil {
+		log.Printf("[%s] %v", ref, err)
+	}
+	if r.cfg.PollPRs {
+		if err := r.processPRs(ctx, ref); err != nil {
+			log.Printf("[%s] pulls: %v", ref.Repo(), err)
 		}
 	}
 }

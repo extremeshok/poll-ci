@@ -6,12 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -268,6 +270,35 @@ func TestScrubAndOneLine(t *testing.T) {
 	if got := oneLine("a\n  b\t c \n"); got != "a b c" {
 		t.Errorf("oneLine: %q", got)
 	}
+}
+
+// The store is the only state shared between concurrent ref workers; exercise
+// it from several goroutines so `go test -race` covers that path.
+func TestStoreConcurrent(t *testing.T) {
+	s, err := LoadStore(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ref := Ref{Owner: "o", Name: fmt.Sprintf("n%d", i), Branch: "main"}
+			for j := 0; j < 10; j++ {
+				sha := fmt.Sprintf("sha%d", j)
+				if err := s.MarkBranch(ref, sha, sha); err != nil {
+					t.Error(err)
+					return
+				}
+				s.Has(ref, "sha0")
+				s.LastTested(ref)
+				s.SetInFlight(ref.String(), sha)
+				s.ClearInFlight(ref.String())
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 
 func TestNeedsPull(t *testing.T) {

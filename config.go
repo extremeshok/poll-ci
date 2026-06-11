@@ -47,6 +47,7 @@ type RunnerConfig struct {
 	CheckCPUs      string        // CHECK_CPUS — docker --cpus (e.g. "2"; empty = unlimited)
 	CheckPids      string        // CHECK_PIDS — docker --pids-limit (e.g. "4096"; empty = unlimited)
 	ImageRefresh   time.Duration // IMAGE_REFRESH_HOURS — re-pull present images this often (0 = never, the default)
+	Concurrency    int           // CONCURRENCY — refs swept in parallel (default 1 = serial)
 }
 
 // RepoConfig is a repository's .poll-ci.yml.
@@ -124,6 +125,10 @@ func LoadRunnerConfig() (*RunnerConfig, error) {
 		PollInterval:   secondsOr("POLL_INTERVAL", 60),
 		DefaultTimeout: secondsOr("DEFAULT_TIMEOUT", 1800),
 		ImageRefresh:   time.Duration(intEnv("IMAGE_REFRESH_HOURS", 0)) * time.Hour,
+		Concurrency:    intEnv("CONCURRENCY", 1),
+	}
+	if c.Concurrency < 1 {
+		c.Concurrency = 1
 	}
 	if c.Token == "" {
 		return nil, fmt.Errorf("GITHUB_TOKEN is required")
