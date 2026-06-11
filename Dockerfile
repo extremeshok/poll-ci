@@ -16,8 +16,11 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -o /out/poll-ci .
 
 # --- runtime stage ----------------------------------------------------------
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates git docker-cli tini
+# apk upgrade picks up post-release security fixes for the base packages — a
+# stale base is exactly how image scans (trivy etc.) start blocking deploys.
+FROM alpine:3.24
+RUN apk -U upgrade --no-cache && \
+    apk add --no-cache ca-certificates git docker-cli tini
 COPY --from=build /out/poll-ci /usr/local/bin/poll-ci
 
 # State (the tested-SHA set) lives here; mount a volume to persist it.
