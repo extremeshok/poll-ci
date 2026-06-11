@@ -270,6 +270,19 @@ func TestScrubAndOneLine(t *testing.T) {
 	}
 }
 
+func TestLimitArgs(t *testing.T) {
+	r := &Runner{cfg: &RunnerConfig{}}
+	if got := r.limitArgs(); len(got) != 0 {
+		t.Errorf("no limits configured should add no flags, got %v", got)
+	}
+	r = &Runner{cfg: &RunnerConfig{CheckMemory: "2g", CheckCPUs: "1.5", CheckPids: "4096"}}
+	want := []string{"--memory", "2g", "--cpus", "1.5", "--pids-limit", "4096"}
+	got := r.limitArgs()
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("limitArgs = %v, want %v", got, want)
+	}
+}
+
 func TestInstanceID(t *testing.T) {
 	a, b := instanceID("/var/lib/poll-ci/state.json"), instanceID("/tmp/other/state.json")
 	if len(a) != 8 || len(b) != 8 {

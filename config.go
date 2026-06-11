@@ -42,6 +42,9 @@ type RunnerConfig struct {
 	PollPRs        bool          // POLL_PRS — also test same-repo open PR heads
 	ShortCircuit   bool          // SHORT_CIRCUIT — abort a stale run when a newer tip appears (default true)
 	MarkSkipped    bool          // MARK_SKIPPED — post a terminal `ci` status on never-tested intermediate commits
+	CheckMemory    string        // CHECK_MEMORY — docker --memory for check/scan containers (e.g. "2g"; empty = unlimited)
+	CheckCPUs      string        // CHECK_CPUS — docker --cpus (e.g. "2"; empty = unlimited)
+	CheckPids      string        // CHECK_PIDS — docker --pids-limit (e.g. "4096"; empty = unlimited)
 }
 
 // RepoConfig is a repository's .poll-ci.yml.
@@ -113,11 +116,22 @@ func LoadRunnerConfig() (*RunnerConfig, error) {
 		PollPRs:        truthy(os.Getenv("POLL_PRS")),
 		ShortCircuit:   boolEnv("SHORT_CIRCUIT", true),
 		MarkSkipped:    truthy(os.Getenv("MARK_SKIPPED")),
+		CheckMemory:    os.Getenv("CHECK_MEMORY"),
+		CheckCPUs:      os.Getenv("CHECK_CPUS"),
+		CheckPids:      os.Getenv("CHECK_PIDS"),
 		PollInterval:   secondsOr("POLL_INTERVAL", 60),
 		DefaultTimeout: secondsOr("DEFAULT_TIMEOUT", 1800),
 	}
 	if c.Token == "" {
 		return nil, fmt.Errorf("GITHUB_TOKEN is required")
+	}
+	// These become docker argv; same conservative charset as the scan: fields.
+	for _, f := range []struct{ name, val string }{
+		{"CHECK_MEMORY", c.CheckMemory}, {"CHECK_CPUS", c.CheckCPUs}, {"CHECK_PIDS", c.CheckPids},
+	} {
+		if f.val != "" && !safeArg(f.val) {
+			return nil, fmt.Errorf("%s contains unsupported characters: %q", f.name, f.val)
+		}
 	}
 	c.APIBase = strings.TrimRight(c.APIBase, "/")
 

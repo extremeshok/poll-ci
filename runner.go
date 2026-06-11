@@ -679,6 +679,7 @@ func (r *Runner) ensureImage(ctx context.Context, image string) {
 // dockerCreate creates (but does not start) a container that runs the check.
 func (r *Runner) dockerCreate(ctx context.Context, image, run string) (string, error) {
 	args := append([]string{"create"}, r.labelArgs()...)
+	args = append(args, r.limitArgs()...)
 	args = append(args, "-w", "/repo", image, "sh", "-ec", run)
 	out, errb, err := r.dockerRun(ctx, args...)
 	if err != nil {
@@ -691,6 +692,23 @@ func (r *Runner) dockerCreate(ctx context.Context, image, run string) (string, e
 // instance-scoped one the startup orphan sweep filters on.
 func (r *Runner) labelArgs() []string {
 	return []string{"--label", "poll-ci", "--label", "poll-ci.instance=" + r.instance}
+}
+
+// limitArgs returns the optional resource-limit flags for check/scan
+// containers, so a runaway check can't starve the CI host. Empty (the default)
+// means no limit — today's behavior.
+func (r *Runner) limitArgs() []string {
+	var args []string
+	if v := r.cfg.CheckMemory; v != "" {
+		args = append(args, "--memory", v)
+	}
+	if v := r.cfg.CheckCPUs; v != "" {
+		args = append(args, "--cpus", v)
+	}
+	if v := r.cfg.CheckPids; v != "" {
+		args = append(args, "--pids-limit", v)
+	}
+	return args
 }
 
 // sweepOrphans removes containers and checkout dirs left behind by a previous
@@ -726,6 +744,7 @@ func (r *Runner) sweepOrphans(ctx context.Context) {
 // as the trivy cache to persist the vulnerability DB across runs.
 func (r *Runner) dockerCreateScan(ctx context.Context, image, cacheVolume string, trivyArgs []string) (string, error) {
 	args := append([]string{"create"}, r.labelArgs()...)
+	args = append(args, r.limitArgs()...)
 	args = append(args, "-w", "/repo", "-v", cacheVolume+":/trivy-cache", image)
 	args = append(args, trivyArgs...)
 	out, errb, err := r.dockerRun(ctx, args...)
