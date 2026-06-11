@@ -198,6 +198,40 @@ func (g *GitHub) ListOpenPRs(ctx context.Context, ref Ref) ([]PR, error) {
 	return prs, nil
 }
 
+// CompareCommits returns the commit SHAs reachable from head but not base,
+// oldest first (GitHub caps the list at 250 — plenty for marking the skipped
+// intermediates of a push).
+func (g *GitHub) CompareCommits(ctx context.Context, ref Ref, base, head string) ([]string, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/compare/%s...%s", g.apiBase, ref.Owner, ref.Name, base, head)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	g.setHeaders(req)
+
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, apiErr(resp, fmt.Sprintf("compare %s...%s", short(base), short(head)))
+	}
+	var raw struct {
+		Commits []struct {
+			SHA string `json:"sha"`
+		} `json:"commits"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+	shas := make([]string, 0, len(raw.Commits))
+	for _, c := range raw.Commits {
+		shas = append(shas, c.SHA)
+	}
+	return shas, nil
+}
+
 // FastForwardRef points branch at sha as a fast-forward (force=false, so GitHub
 // rejects a non-fast-forward update with 422). It creates the branch if it does
 // not exist yet. Needs the token to have "Contents: write".

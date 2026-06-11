@@ -41,6 +41,7 @@ type RunnerConfig struct {
 	DockerBin      string        // DOCKER_BIN (default "docker")
 	PollPRs        bool          // POLL_PRS — also test same-repo open PR heads
 	ShortCircuit   bool          // SHORT_CIRCUIT — abort a stale run when a newer tip appears (default true)
+	MarkSkipped    bool          // MARK_SKIPPED — post a terminal `ci` status on never-tested intermediate commits
 }
 
 // RepoConfig is a repository's .poll-ci.yml.
@@ -111,6 +112,7 @@ func LoadRunnerConfig() (*RunnerConfig, error) {
 		DockerBin:      envOr("DOCKER_BIN", "docker"),
 		PollPRs:        truthy(os.Getenv("POLL_PRS")),
 		ShortCircuit:   boolEnv("SHORT_CIRCUIT", true),
+		MarkSkipped:    truthy(os.Getenv("MARK_SKIPPED")),
 		PollInterval:   secondsOr("POLL_INTERVAL", 60),
 		DefaultTimeout: secondsOr("DEFAULT_TIMEOUT", 1800),
 	}

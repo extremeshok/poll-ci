@@ -606,6 +606,31 @@ func TestListStatuses(t *testing.T) {
 	}
 }
 
+func TestCompareCommits(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/compare/aaa...bbb") {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ahead_by":3,"commits":[{"sha":"c1"},{"sha":"c2"},{"sha":"bbb"}]}`))
+	}))
+	defer srv.Close()
+	gh := NewGitHub("tok", srv.URL)
+	shas, err := gh.CompareCommits(context.Background(), Ref{Owner: "o", Name: "n"}, "aaa", "bbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"c1", "c2", "bbb"}
+	if len(shas) != len(want) {
+		t.Fatalf("got %v, want %v", shas, want)
+	}
+	for i := range want {
+		if shas[i] != want[i] {
+			t.Fatalf("got %v, want %v", shas, want)
+		}
+	}
+}
+
 func TestStoreRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	s, err := LoadStore(path)

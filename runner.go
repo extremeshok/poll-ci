@@ -144,9 +144,37 @@ func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 			return false, nil
 		}
 	}
+	prev := r.store.LastTested(ref) // baseline before this run overwrites it
 	err = r.store.MarkBranch(ref, tip, sha)
 	r.clearInFlight(ref.String())
+	if r.cfg.MarkSkipped {
+		r.markSkipped(ctx, ref, prev, sha)
+	}
 	return superseded, err
+}
+
+// markSkipped posts a terminal `ci` status on commits that were pushed but
+// never tested because a newer tip superseded them before a poll sampled them
+// (poll-ci tests branch HEADs only). State `error`, not `success`: a green
+// status would let branch protection pass an untested commit. The SHAs are not
+// marked seen, so a force-push back to one re-runs it for real. Opt-in via
+// MARK_SKIPPED.
+func (r *Runner) markSkipped(ctx context.Context, ref Ref, prev, tested string) {
+	if prev == "" || prev == tested {
+		return
+	}
+	shas, err := r.gh.CompareCommits(ctx, ref, prev, tested)
+	if err != nil {
+		log.Printf("[%s] mark-skipped: %v", ref, err)
+		return
+	}
+	for _, s := range shas {
+		if s == tested || r.store.Has(ref, s) {
+			continue
+		}
+		log.Printf("[%s] %s skipped (never the tip at a poll)", ref, short(s))
+		r.setStatus(ctx, ref, s, StateError, "ci", "not tested — superseded by "+short(tested))
+	}
 }
 
 // watchForNewerTip polls the branch tip during a run and cancels it (with a
