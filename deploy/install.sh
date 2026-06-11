@@ -106,10 +106,12 @@ HEARTBEAT_REPO=extremeshok/dnscontrol-ui
 # HEARTBEAT_ALERT_URL=
 # Optional external dead-man's-switch pinged on every HEALTHY run (e.g. healthchecks.io):
 # HEARTBEAT_PING_URL=
-# Tuning (defaults shown):
+# Tuning (defaults shown). MAX_LAG=0: GRACE alone debounces an in-progress
+# gate; a higher value would never alert on a promote failure affecting only
+# the tip commit.
 # HEARTBEAT_WATCH_BRANCH=master
 # HEARTBEAT_TARGET_BRANCH=release
-# HEARTBEAT_MAX_LAG=1
+# HEARTBEAT_MAX_LAG=0
 # HEARTBEAT_GRACE_SECONDS=2400
 HENV
     )

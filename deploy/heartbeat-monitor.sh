@@ -24,7 +24,11 @@
 #   Required: HEARTBEAT_REPO=owner/name   (the repo poll-ci watches)
 #   Common:   HEARTBEAT_ALERT_URL=...     (apprise JSON / generic webhook; POST {title,body})
 #   Optional: HEARTBEAT_WATCH_BRANCH=master  HEARTBEAT_TARGET_BRANCH=release
-#             HEARTBEAT_MAX_LAG=1           (commits master may lead release by)
+#             HEARTBEAT_MAX_LAG=0           (commits master may lead release by before the
+#                                            stall clock starts; GRACE alone debounces an
+#                                            in-progress gate. >0 would treat a promote
+#                                            failure on a single tip commit as healthy
+#                                            forever — the exact incident this monitors.)
 #             HEARTBEAT_GRACE_SECONDS=2400  (40m > slowest gate; stall threshold)
 #             HEARTBEAT_PING_URL=...        (external dead-man's-switch, pinged when healthy)
 #             HEARTBEAT_STATE_FILE=/var/lib/poll-ci/heartbeat.state
@@ -41,7 +45,7 @@ ENV_FILE="${HEARTBEAT_ENV_FILE:-/etc/poll-ci/poll-ci.env}"
 REPO="${HEARTBEAT_REPO:-}"
 WATCH="${HEARTBEAT_WATCH_BRANCH:-master}"
 TARGET="${HEARTBEAT_TARGET_BRANCH:-release}"
-MAX_LAG="${HEARTBEAT_MAX_LAG:-1}"
+MAX_LAG="${HEARTBEAT_MAX_LAG:-0}"
 GRACE="${HEARTBEAT_GRACE_SECONDS:-2400}"
 CONTAINER="${POLL_CI_NAME:-poll-ci}"
 ALERT_URL="${HEARTBEAT_ALERT_URL:-}"
@@ -95,13 +99,17 @@ if [ -z "$cmp" ]; then
 fi
 
 # ahead_by = commits WATCH leads TARGET by (pending promotion);
-# base_commit.sha = the TARGET (release) tip — the first "sha" in a compare body.
+# base_commit.sha = the TARGET (release) tip. Without jq, take the FIRST sha
+# after the "base_commit" key — a greedy sed over the whole body would match
+# the LAST sha in the payload instead (a nested tree/parent sha).
 if command -v jq >/dev/null 2>&1; then
   ahead="$(printf '%s' "$cmp" | jq -r '.ahead_by // 0')"
   release_sha="$(printf '%s' "$cmp" | jq -r '.base_commit.sha // empty')"
 else
   ahead="$(printf '%s' "$cmp" | sed -n 's/.*"ahead_by":[[:space:]]*\([0-9]*\).*/\1/p' | head -1)"
-  release_sha="$(printf '%s' "$cmp" | sed -n 's/.*"sha":[[:space:]]*"\([0-9a-f]\{7,40\}\)".*/\1/p' | head -1)"
+  release_sha="$(printf '%s' "$cmp" | tr -d '\n' | awk -F'"base_commit"' 'NF>1{print $2}' \
+                 | grep -o '"sha"[[:space:]]*:[[:space:]]*"[0-9a-f]\{40\}"' | head -1 \
+                 | grep -o '[0-9a-f]\{40\}')"
 fi
 [ -n "$ahead" ] || ahead=0
 
