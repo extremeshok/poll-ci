@@ -1,0 +1,11 @@
+[Unit]
+Description=poll-ci self-update — pull :latest and restart poll-ci if the image changed
+Documentation=https://github.com/extremeshok/poll-ci
+Requires=docker.service
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/poll-ci-autoupdate
+Nice=10

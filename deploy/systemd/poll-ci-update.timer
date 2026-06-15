@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for a new poll-ci image daily and upgrade if it changed
+Documentation=https://github.com/extremeshok/poll-ci
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+Unit=poll-ci-update.service
+
+[Install]
+WantedBy=timers.target
