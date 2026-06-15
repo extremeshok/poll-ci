@@ -622,9 +622,9 @@ the bundled unit + installer in [`deploy/`](deploy):
 
 ```bash
 # from a checkout on the host:
-sudo deploy/install.sh             # install + enable  (--build builds the image
-                                   # first; --start starts now; --autoupdate adds the
-                                   # daily image self-update timer; --heartbeat adds
+sudo deploy/install.sh             # install + enable, incl. the daily self-update timer
+                                   # (--build builds the image first; --start starts now;
+                                   # --noautoupdate skips self-update; --heartbeat adds
                                    # the dead-man's-switch)
 sudoedit /etc/poll-ci/poll-ci.env  # set GITHUB_TOKEN  (this file is 0600)
 sudoedit /etc/poll-ci/repos.yml    # the repo(s) to watch
@@ -698,10 +698,12 @@ State on the volume is preserved, so already-tested commits aren't re-run.
 
 **Automatic updates (optional).** Two paths, depending on how you deployed:
 
-- **systemd (the `install.sh` way).** Add the bundled self-update timer:
+- **systemd (the `install.sh` way).** The installer enables a self-update timer
+  **by default** — pass `--noautoupdate` to skip it (or `sudo systemctl disable --now
+  poll-ci-update.timer` later):
 
   ```bash
-  sudo deploy/install.sh --autoupdate     # or: sudo systemctl enable --now poll-ci-update.timer
+  sudo deploy/install.sh                  # self-update timer included
   ```
 
   A daily timer (with up to an hour of jitter) pulls `:latest` and — **only if the

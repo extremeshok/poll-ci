@@ -2,23 +2,22 @@
 #
 # install.sh — install poll-ci as a systemd-managed Docker service.
 #
-#   sudo deploy/install.sh            # install + enable (set the token after)
-#   sudo deploy/install.sh --build    # also build the image from this checkout
-#   sudo deploy/install.sh --start    # also (re)start once config is in place
+#   sudo deploy/install.sh              # install + enable, incl. the daily self-update timer
+#   sudo deploy/install.sh --build      # also build the image from this checkout
+#   sudo deploy/install.sh --start      # also (re)start once config is in place
+#   sudo deploy/install.sh --noautoupdate # skip the daily image self-update timer
 #   sudo deploy/install.sh --heartbeat  # also install the dead-man's-switch timer
-#   sudo deploy/install.sh --autoupdate # also install the daily image self-update timer
 #
 # Creates (config files only if missing — re-running never overwrites secrets):
 #   /etc/poll-ci/poll-ci.env            0600, holds GITHUB_TOKEN
 #   /etc/poll-ci/repos.yml              repos to watch
 #   /etc/systemd/system/poll-ci.service + a drop-in pinning the image
+#   /usr/local/bin/poll-ci-autoupdate                      the image-update script
+#   /etc/systemd/system/poll-ci-update.{service,timer}     the daily upgrade check (--noautoupdate to skip)
 # With --heartbeat, also:
 #   /usr/local/bin/poll-ci-heartbeat                       the monitor script
 #   /etc/poll-ci/heartbeat.env                             0640, HEARTBEAT_* config
 #   /etc/systemd/system/poll-ci-heartbeat.{service,timer}  the periodic check
-# With --autoupdate, also:
-#   /usr/local/bin/poll-ci-autoupdate                      the image-update script
-#   /etc/systemd/system/poll-ci-update.{service,timer}     the daily upgrade check
 #
 # Override the image/name:  POLL_CI_IMAGE=… POLL_CI_NAME=… sudo deploy/install.sh
 set -euo pipefail
@@ -33,14 +32,15 @@ UNIT_SRC="${SRC_DIR}/systemd/poll-ci.service"
 DO_BUILD=false
 DO_START=false
 DO_HEARTBEAT=false
-DO_AUTOUPDATE=false
+DO_AUTOUPDATE=true   # daily image self-update is on by default; --noautoupdate opts out
 for a in "$@"; do
   case "$a" in
     --build) DO_BUILD=true ;;
     --start) DO_START=true ;;
     --heartbeat) DO_HEARTBEAT=true ;;
     --autoupdate) DO_AUTOUPDATE=true ;;
-    -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --noautoupdate) DO_AUTOUPDATE=false ;;
+    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $a" >&2; exit 2 ;;
   esac
 done
