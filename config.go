@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -48,6 +49,11 @@ type RunnerConfig struct {
 	CheckPids      string        // CHECK_PIDS — docker --pids-limit (e.g. "4096"; empty = unlimited)
 	ImageRefresh   time.Duration // IMAGE_REFRESH_HOURS — re-pull present images this often (0 = never, the default)
 	Concurrency    int           // CONCURRENCY — refs swept in parallel (default 1 = serial)
+
+	CheckConcurrency int           // CHECK_CONCURRENCY — a commit's checks run in parallel up to this many (default: host CPU count; 1 = serial)
+	CheckCPUBudget   float64       // CHECK_CPU_BUDGET — total --cpus admitted at once across a commit's checks (default NumCPU)
+	CacheEnabled     bool          // CACHE — opt-in clean dependency-cache copy-in (default false; CACHE=true enables)
+	CacheRefresh     time.Duration // CACHE_REFRESH_HOURS — re-prime the golden cache at least this often (default 24h; 0 = only when missing/stale)
 }
 
 // RepoConfig is a repository's .poll-ci.yml.
@@ -56,6 +62,52 @@ type RepoConfig struct {
 	Checks  []Check  `yaml:"checks"`
 	Promote *Promote `yaml:"promote"`
 	Scan    *Scan    `yaml:"scan"`
+	Cache   *Cache   `yaml:"cache"`
+}
+
+// Cache configures dependency caching for a repo. Three forms in .poll-ci.yml:
+//
+//	(absent)                         → auto-detect from ecosystem marker files
+//	cache: false                     → disabled for this repo
+//	cache: {paths: […], prime: "…"}  → explicit cache paths + prime command
+//
+// A clean "golden" cache is built once by the prime command in an isolated
+// container and then copied into each check container; checks never write it
+// back, so it cannot be poisoned by a run (or by a PR). It only speeds runs up —
+// a check must still pass from a cold cache.
+type Cache struct {
+	Disabled bool     // cache: false
+	Explicit bool     // an explicit mapping was given (skip auto-detection)
+	Paths    []string // container paths to persist (absolute)
+	Prime    string   // command run in a clean container to populate the cache
+}
+
+// UnmarshalYAML accepts either `cache: false` (a scalar bool) or an explicit
+// `cache: {paths, prime}` mapping; absence leaves RepoConfig.Cache nil, which
+// the runner treats as "auto-detect".
+func (c *Cache) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		var b bool
+		if err := value.Decode(&b); err != nil {
+			return fmt.Errorf("cache: want `false` or a mapping {paths, prime}")
+		}
+		c.Disabled = !b
+		return nil
+	}
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("cache: want `false` or a mapping {paths, prime}")
+	}
+	var r struct {
+		Paths []string `yaml:"paths"`
+		Prime string   `yaml:"prime"`
+	}
+	if err := value.Decode(&r); err != nil {
+		return fmt.Errorf("invalid cache: %w", err)
+	}
+	c.Explicit = true
+	c.Paths = r.Paths
+	c.Prime = strings.TrimSpace(r.Prime)
+	return nil
 }
 
 // Default trivy image + cache volume for the built-in scan: step.
@@ -71,6 +123,21 @@ type Check struct {
 	Name    string `yaml:"name"`
 	Run     string `yaml:"run"`
 	Timeout int    `yaml:"timeout"` // seconds; 0 → DefaultTimeout
+	CPUs    string `yaml:"cpus"`    // optional docker --cpus, also the check's scheduler cost (empty → 1.0 when parallel)
+	Memory  string `yaml:"memory"`  // optional docker --memory cap (empty → CHECK_MEMORY)
+}
+
+// cpuCost is the check's scheduler cost and docker --cpus value: its cpus: hint,
+// or 1.0 when unset. parseRepoConfig validates that a set hint parses positive.
+func (ck Check) cpuCost() float64 {
+	if ck.CPUs == "" {
+		return 1
+	}
+	n, err := strconv.ParseFloat(ck.CPUs, 64)
+	if err != nil || n <= 0 {
+		return 1
+	}
+	return n
 }
 
 // Promote optionally fast-forwards a target branch to the tested commit when
@@ -126,9 +193,17 @@ func LoadRunnerConfig() (*RunnerConfig, error) {
 		DefaultTimeout: secondsOr("DEFAULT_TIMEOUT", 1800),
 		ImageRefresh:   time.Duration(intEnv("IMAGE_REFRESH_HOURS", 0)) * time.Hour,
 		Concurrency:    intEnv("CONCURRENCY", 1),
+
+		CheckConcurrency: intEnv("CHECK_CONCURRENCY", runtime.NumCPU()),
+		CheckCPUBudget:   floatEnv("CHECK_CPU_BUDGET", float64(runtime.NumCPU())),
+		CacheEnabled:     boolEnv("CACHE", false),
+		CacheRefresh:     time.Duration(intEnv("CACHE_REFRESH_HOURS", 24)) * time.Hour,
 	}
 	if c.Concurrency < 1 {
 		c.Concurrency = 1
+	}
+	if c.CheckConcurrency < 1 {
+		c.CheckConcurrency = 1
 	}
 	if c.Token == "" {
 		return nil, fmt.Errorf("GITHUB_TOKEN is required")
@@ -245,6 +320,19 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 			return nil, fmt.Errorf("duplicate check name %q", ck.Name)
 		}
 		seen[ck.Name] = true
+		// cpus/memory become docker argv; validate the same conservative charset
+		// as the CHECK_* limits, and that a cpus hint is a positive number.
+		if ck.CPUs != "" {
+			if !safeArg(ck.CPUs) {
+				return nil, fmt.Errorf("check %q cpus contains unsupported characters: %q", ck.Name, ck.CPUs)
+			}
+			if n, err := strconv.ParseFloat(ck.CPUs, 64); err != nil || n <= 0 {
+				return nil, fmt.Errorf("check %q cpus must be a positive number: %q", ck.Name, ck.CPUs)
+			}
+		}
+		if ck.Memory != "" && !safeArg(ck.Memory) {
+			return nil, fmt.Errorf("check %q memory contains unsupported characters: %q", ck.Name, ck.Memory)
+		}
 	}
 	if rc.Promote != nil && strings.TrimSpace(rc.Promote.Branch) == "" {
 		return nil, fmt.Errorf("promote: branch must be set (the target branch to fast-forward on green)")
@@ -289,7 +377,45 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 			}
 		}
 	}
+	// An explicit cache: block must name at least one absolute path and a prime
+	// command. cache:false and auto-detect (Cache nil) need no validation here.
+	if rc.Cache != nil && rc.Cache.Explicit {
+		if len(rc.Cache.Paths) == 0 {
+			return nil, fmt.Errorf("cache.paths must list at least one path")
+		}
+		if rc.Cache.Prime == "" {
+			return nil, fmt.Errorf("cache.prime must be set (the command that populates the cache)")
+		}
+		for _, p := range rc.Cache.Paths {
+			if !safeCachePath(p) {
+				return nil, fmt.Errorf("cache.paths entries must be absolute container paths without %q: %q", "..", p)
+			}
+		}
+	}
 	return &rc, nil
+}
+
+// safeCachePath reports whether p is acceptable as a cache mount target: an
+// absolute container path with no ".." element, over the same conservative
+// charset as safeArg (so a typo can't smuggle a docker -v option or surprise).
+func safeCachePath(p string) bool {
+	if !strings.HasPrefix(p, "/") || p == "/" {
+		return false
+	}
+	for _, c := range p {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.' || c == '_' || c == '-' || c == '/':
+		default:
+			return false
+		}
+	}
+	for _, el := range strings.Split(p, "/") {
+		if el == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // safeArg reports whether s is safe to pass as a single docker/trivy argument:
@@ -359,6 +485,21 @@ func intEnv(key string, def int) int {
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 0 {
 		log.Printf("config: ignoring invalid %s=%q (want a non-negative integer); using %d", key, v, def)
+		return def
+	}
+	return n
+}
+
+// floatEnv reads a positive-float env var, warning (and falling back to def) on
+// anything unparseable rather than silently ignoring it.
+func floatEnv(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil || n <= 0 {
+		log.Printf("config: ignoring invalid %s=%q (want a positive number); using %g", key, v, def)
 		return def
 	}
 	return n

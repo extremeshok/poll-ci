@@ -64,6 +64,15 @@ func main() {
 	if cfg.PollPRs {
 		log.Printf("also polling open same-repo PR heads")
 	}
+	if cfg.CheckConcurrency > 1 {
+		log.Printf("checks run up to %d at a time (CHECK_CONCURRENCY); CPU budget %g (CHECK_CPU_BUDGET)", cfg.CheckConcurrency, cfg.CheckCPUBudget)
+		if cfg.CheckMemory == "" {
+			log.Printf("note: set CHECK_MEMORY (or per-check memory:) to bound RAM — parallel checks can OOM-kill (exit 137), which looks like a test failure")
+		}
+	}
+	if cfg.CacheEnabled {
+		log.Printf("dependency caching enabled (CACHE=true)")
+	}
 
 	// Clean up after any previous process that died mid-run: stale containers
 	// and checkouts first, then statuses it left pending on GitHub.

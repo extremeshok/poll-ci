@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -411,14 +412,47 @@ func TestIntEnv(t *testing.T) {
 
 func TestLimitArgs(t *testing.T) {
 	r := &Runner{cfg: &RunnerConfig{}}
-	if got := r.limitArgs(); len(got) != 0 {
-		t.Errorf("no limits configured should add no flags, got %v", got)
+	if got := r.limitArgs("", ""); len(got) != 0 {
+		t.Errorf("no limits should add no flags, got %v", got)
 	}
-	r = &Runner{cfg: &RunnerConfig{CheckMemory: "2g", CheckCPUs: "1.5", CheckPids: "4096"}}
+	r = &Runner{cfg: &RunnerConfig{CheckPids: "4096"}}
 	want := []string{"--memory", "2g", "--cpus", "1.5", "--pids-limit", "4096"}
-	got := r.limitArgs()
+	got := r.limitArgs("1.5", "2g")
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("limitArgs = %v, want %v", got, want)
+	}
+}
+
+func TestEffectiveLimits(t *testing.T) {
+	r := &Runner{cfg: &RunnerConfig{CheckCPUs: "2", CheckMemory: "4g"}}
+	// Per-check hint wins, else the global CHECK_CPUS / CHECK_MEMORY.
+	if got := r.effectiveCPUs(Check{}); got != "2" {
+		t.Errorf("unhinted cpus = %q, want global 2", got)
+	}
+	if got := r.effectiveCPUs(Check{CPUs: "0.5"}); got != "0.5" {
+		t.Errorf("hinted cpus = %q, want 0.5", got)
+	}
+	if got := r.effectiveMemory(Check{Memory: "1g"}); got != "1g" {
+		t.Errorf("hinted memory = %q, want 1g", got)
+	}
+	if got := r.effectiveMemory(Check{}); got != "4g" {
+		t.Errorf("unhinted memory = %q, want global 4g", got)
+	}
+	// No hint and no global => no --cpus cap (the check shares the host CPUs).
+	r2 := &Runner{cfg: &RunnerConfig{}}
+	if got := r2.effectiveCPUs(Check{}); got != "" {
+		t.Errorf("unhinted cpus with no global = %q, want empty (uncapped)", got)
+	}
+}
+
+func TestCPUCost(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want float64
+	}{{"", 1}, {"2", 2}, {"0.5", 0.5}, {"garbage", 1}, {"-1", 1}} {
+		if got := (Check{CPUs: tc.in}).cpuCost(); got != tc.want {
+			t.Errorf("cpuCost(%q) = %v, want %v", tc.in, got, tc.want)
+		}
 	}
 }
 
@@ -839,4 +873,278 @@ func TestStoreRoundTrip(t *testing.T) {
 	if s2.Has(Ref{Owner: "x", Name: "y"}, "deadbeef") {
 		t.Fatal("SHA leaked across repos")
 	}
+}
+
+func TestCheckConcurrencyConfig(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "x")
+	t.Setenv("REPO", "o/n")
+	t.Setenv("WORK_DIR", t.TempDir())
+	ncpu := runtime.NumCPU()
+	for _, tc := range []struct {
+		set  string
+		want int
+	}{{"", ncpu}, {"0", 1}, {"-2", ncpu}, {"3", 3}} { // unset/invalid → NumCPU; "0" hits the <1 clamp
+		if tc.set == "" {
+			os.Unsetenv("CHECK_CONCURRENCY")
+		} else {
+			t.Setenv("CHECK_CONCURRENCY", tc.set)
+		}
+		cfg, err := LoadRunnerConfig()
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.CheckConcurrency != tc.want {
+			t.Errorf("CHECK_CONCURRENCY=%q → %d, want %d", tc.set, cfg.CheckConcurrency, tc.want)
+		}
+	}
+	os.Unsetenv("CHECK_CONCURRENCY")
+	cfg, err := LoadRunnerConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CheckCPUBudget != float64(ncpu) {
+		t.Errorf("default CPU budget = %v, want NumCPU %d", cfg.CheckCPUBudget, ncpu)
+	}
+	if cfg.CacheEnabled {
+		t.Error("cache should default off (opt-in)")
+	}
+}
+
+func TestSafeCachePath(t *testing.T) {
+	for _, p := range []string{"/go/pkg/mod", "/root/.cache/go-build", "/a"} {
+		if !safeCachePath(p) {
+			t.Errorf("%q should be valid", p)
+		}
+	}
+	for _, p := range []string{"", "/", "relative", "/a/../b", "/a b", "/a;b", "/a|b"} {
+		if safeCachePath(p) {
+			t.Errorf("%q should be invalid", p)
+		}
+	}
+}
+
+func TestParseRepoConfigCache(t *testing.T) {
+	base := "image: x\nchecks:\n  - {name: a, run: b}\n"
+	// Absent → auto-detect (nil).
+	if rc, err := parseRepoConfig([]byte(base)); err != nil || rc.Cache != nil {
+		t.Fatalf("absent cache → nil, got %+v err %v", rc.Cache, err)
+	}
+	// cache: false → disabled.
+	if rc, err := parseRepoConfig([]byte(base + "cache: false\n")); err != nil || rc.Cache == nil || !rc.Cache.Disabled {
+		t.Fatalf("cache:false → Disabled, got %+v err %v", rc.Cache, err)
+	}
+	// Explicit mapping.
+	rc, err := parseRepoConfig([]byte(base + "cache:\n  paths: [/go/pkg/mod]\n  prime: go mod download\n"))
+	if err != nil || rc.Cache == nil || !rc.Cache.Explicit || len(rc.Cache.Paths) != 1 || rc.Cache.Prime != "go mod download" {
+		t.Fatalf("explicit cache parse: %+v err %v", rc.Cache, err)
+	}
+	// Explicit without prime, bad path, dotdot → errors.
+	for _, bad := range []string{
+		"cache:\n  paths: [/go/pkg/mod]\n",
+		"cache:\n  paths: [relative]\n  prime: x\n",
+		"cache:\n  paths: [/a/../b]\n  prime: x\n",
+	} {
+		if _, err := parseRepoConfig([]byte(base + bad)); err == nil {
+			t.Errorf("expected error for:\n%s", bad)
+		}
+	}
+}
+
+func TestParseRepoConfigCheckLimits(t *testing.T) {
+	base := "image: x\nchecks:\n  - {name: a, run: b, %s}\n"
+	if _, err := parseRepoConfig([]byte(fmt.Sprintf(base, `cpus: "2", memory: "1g"`))); err != nil {
+		t.Errorf("valid cpus/memory hints should parse: %v", err)
+	}
+	for _, bad := range []string{`cpus: "abc"`, `cpus: "-1"`, `memory: "1 g"`} {
+		if _, err := parseRepoConfig([]byte(fmt.Sprintf(base, bad))); err == nil {
+			t.Errorf("expected error for check hint %q", bad)
+		}
+	}
+}
+
+func TestResolveCache(t *testing.T) {
+	r := &Runner{cfg: &RunnerConfig{CacheEnabled: true}}
+	dir := t.TempDir()
+	if p := r.resolveCache(&RepoConfig{}, dir); len(p.paths) != 0 {
+		t.Errorf("no markers → no cache, got %+v", p)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := r.resolveCache(&RepoConfig{}, dir)
+	if len(p.paths) == 0 || !strings.Contains(p.prime, "go mod download") {
+		t.Errorf("go.mod should auto-detect the go preset, got %+v", p)
+	}
+	if p := (&Runner{cfg: &RunnerConfig{CacheEnabled: false}}).resolveCache(&RepoConfig{}, dir); len(p.paths) != 0 {
+		t.Errorf("CACHE=false → no cache, got %+v", p)
+	}
+	if p := r.resolveCache(&RepoConfig{Cache: &Cache{Disabled: true}}, dir); len(p.paths) != 0 {
+		t.Errorf("cache:false → no cache, got %+v", p)
+	}
+	pe := r.resolveCache(&RepoConfig{Cache: &Cache{Explicit: true, Paths: []string{"/x", "/x"}, Prime: "p"}}, dir)
+	if len(pe.paths) != 1 || pe.prime != "p" {
+		t.Errorf("explicit cache (deduped) = %+v", pe)
+	}
+}
+
+func TestCacheKey(t *testing.T) {
+	a := cacheKey("o/n", "main")
+	if a == cacheKey("o/n", "dev") || a == cacheKey("o/other", "main") {
+		t.Error("different repo/branch must yield different keys")
+	}
+	if a != cacheKey("o/n", "main") {
+		t.Error("cacheKey must be stable")
+	}
+	if len(a) != 16 || strings.ContainsAny(a, "/ .") {
+		t.Errorf("key should be 16 fs-safe hex chars, got %q", a)
+	}
+}
+
+func TestLockfileHash(t *testing.T) {
+	dir := t.TempDir()
+	if lockfileHash(dir, []string{"go.sum"}) != "" {
+		t.Error("no files → empty hash")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.sum"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h1 := lockfileHash(dir, []string{"go.sum"})
+	if h1 == "" {
+		t.Error("present file → non-empty hash")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.sum"), []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if lockfileHash(dir, []string{"go.sum"}) == h1 {
+		t.Error("a content change must change the hash")
+	}
+}
+
+func TestBlockBuffer(t *testing.T) {
+	b := &blockBuffer{max: 64}
+	b.Write([]byte("hello\nworld\n"))
+	var sb strings.Builder
+	b.flush(&sb, "ci/x — passed in 1s")
+	out := sb.String()
+	if !strings.Contains(out, "===== ci/x — passed in 1s =====") || !strings.Contains(out, "world") {
+		t.Errorf("block missing header or body: %q", out)
+	}
+	var sb2 strings.Builder
+	b.flush(&sb2, "again")
+	if sb2.Len() != 0 {
+		t.Errorf("second flush must be a no-op, got %q", sb2.String())
+	}
+	// Over cap: keep the tail, note the truncation.
+	b2 := &blockBuffer{max: 8}
+	b2.Write([]byte("0123456789ABCDEF"))
+	var sb3 strings.Builder
+	b2.flush(&sb3, "t")
+	if !strings.Contains(sb3.String(), "truncated") || !strings.Contains(sb3.String(), "9ABCDEF") {
+		t.Errorf("expected truncation note + tail, got %q", sb3.String())
+	}
+}
+
+func TestRunUnits(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	r := &Runner{cfg: &RunnerConfig{}, gh: NewGitHub("t", srv.URL)}
+	ref := Ref{Owner: "o", Name: "n", Branch: "main"}
+
+	var (
+		mu              sync.Mutex
+		curCost, maxCst float64
+		curCnt, maxCnt  int
+	)
+	mk := func(cost float64, ok bool) unit {
+		return unit{sctx: "ci/x", cost: cost, run: func(ctx context.Context) (bool, string) {
+			mu.Lock()
+			curCnt++
+			curCost += cost
+			if curCnt > maxCnt {
+				maxCnt = curCnt
+			}
+			if curCost > maxCst {
+				maxCst = curCost
+			}
+			mu.Unlock()
+			time.Sleep(15 * time.Millisecond)
+			mu.Lock()
+			curCnt--
+			curCost -= cost
+			mu.Unlock()
+			return ok, "done"
+		}}
+	}
+	// budget 3: cost-1 units pack ≤3 at a time; the cost-3 unit runs alone.
+	units := []unit{mk(1, true), mk(1, false), mk(3, true), mk(1, true), mk(1, false), mk(1, true)}
+	failed, completed := r.runUnits(context.Background(), ref, "sha", units, 10, 3)
+	if maxCst > 3 {
+		t.Errorf("peak running cost %v exceeded budget 3", maxCst)
+	}
+	if failed != 2 {
+		t.Errorf("failed = %d, want 2", failed)
+	}
+	for i, c := range completed {
+		if !c {
+			t.Errorf("unit %d should have completed", i)
+		}
+	}
+
+	// Count cap dominates when the budget is generous.
+	maxCnt = 0
+	r.runUnits(context.Background(), ref, "sha", []unit{mk(1, true), mk(1, true), mk(1, true), mk(1, true)}, 2, 100)
+	if maxCnt > 2 {
+		t.Errorf("peak concurrency %d exceeded maxCount 2", maxCnt)
+	}
+
+	// Cancelled before launch → nothing runs, nothing completes.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, c := r.runUnits(ctx, ref, "sha", []unit{mk(1, true)}, 10, 3); c[0] {
+		t.Error("a unit not launched under a cancelled ctx must not be completed")
+	}
+}
+
+func TestDetectMonorepo(t *testing.T) {
+	dir := t.TempDir()
+	mk := func(p, c string) {
+		full := filepath.Join(dir, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("go.mod", "module root")
+	mk("svc/api/go.mod", "module api")
+	mk("web/package-lock.json", "{}")
+	mk("node_modules/x/package-lock.json", "{}") // vendored dep: must be skipped
+
+	plan := detectCachePlan(dir)
+	if !hasStr(plan.paths, "/go/pkg/mod") || !hasStr(plan.paths, "/root/.npm") {
+		t.Errorf("paths should cover go + npm, got %+v", plan.paths)
+	}
+	for _, want := range []string{"go mod download", "cd 'svc/api'", "cd 'web'", "npm ci"} {
+		if !strings.Contains(plan.prime, want) {
+			t.Errorf("prime missing %q in: %s", want, plan.prime)
+		}
+	}
+	if strings.Contains(plan.prime, "node_modules") {
+		t.Errorf("prime must skip node_modules: %s", plan.prime)
+	}
+	if len(plan.markers) != 3 {
+		t.Errorf("expected 3 markers (root+nested go, web npm), got %v", plan.markers)
+	}
+}
+
+func hasStr(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }

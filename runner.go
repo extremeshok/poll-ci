@@ -28,15 +28,18 @@ import (
 
 // Runner ties together config, the GitHub client, and the seen-SHA store.
 type Runner struct {
-	cfg     *RunnerConfig
-	gh      *GitHub
-	store   *Store
+	cfg      *RunnerConfig
+	gh       *GitHub
+	store    *Store
 	authB64  string   // base64("x-access-token:" + token), for git's auth header
 	secrets  []string // every form of the token that must never reach a log line
 	instance string   // label value scoping this instance's containers for the orphan sweep
 
 	pullMu sync.Mutex           // guards pulled (PollOnce may run refs concurrently)
 	pulled map[string]time.Time // image → last pull attempt, for IMAGE_REFRESH_HOURS
+
+	cacheMu    sync.Mutex             // guards cacheLocks
+	cacheLocks map[string]*sync.Mutex // golden-cache key → prime/harvest serializer
 }
 
 // NewRunner constructs a Runner.
@@ -44,10 +47,11 @@ func NewRunner(cfg *RunnerConfig, gh *GitHub, store *Store) *Runner {
 	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + cfg.Token))
 	return &Runner{
 		cfg: cfg, gh: gh, store: store,
-		authB64:  auth,
-		secrets:  []string{cfg.Token, auth},
-		instance: instanceID(cfg.StateFile),
-		pulled:   map[string]time.Time{},
+		authB64:    auth,
+		secrets:    []string{cfg.Token, auth},
+		instance:   instanceID(cfg.StateFile),
+		pulled:     map[string]time.Time{},
+		cacheLocks: map[string]*sync.Mutex{},
 	}
 }
 
@@ -155,8 +159,8 @@ func (r *Runner) processBranchOnce(ctx context.Context, ref Ref) (bool, error) {
 	if r.cfg.ShortCircuit {
 		go r.watchForNewerTip(runCtx, ref, "refs/heads/"+ref.Branch, sha, cancel)
 	}
-	passed, completed := r.runCommit(runCtx, ref, sha, dir)
-	cancel(nil) // run finished — stop the watcher
+	passed, completed := r.runCommit(runCtx, ref, sha, dir, true) // branch run: may prime the cache
+	cancel(nil)                                                   // run finished — stop the watcher
 
 	// Short-circuited: a newer commit superseded this run before it finished.
 	// runCommit has already resolved the per-check and ci/trivy contexts to
@@ -278,8 +282,8 @@ func (r *Runner) processPRs(ctx context.Context, ref Ref) error {
 		if r.cfg.ShortCircuit {
 			go r.watchForNewerTip(runCtx, ref, fmt.Sprintf("refs/pull/%d/head", pr.Number), pr.HeadSHA, cancel)
 		}
-		_, completed := r.runCommit(runCtx, ref, pr.HeadSHA, dir)
-		cancel(nil) // run finished — stop the watcher
+		_, completed := r.runCommit(runCtx, ref, pr.HeadSHA, dir, false) // PR run: read the golden cache, never prime/write it
+		cancel(nil)                                                      // run finished — stop the watcher
 		os.RemoveAll(dir)
 
 		var se *supersededError
@@ -377,16 +381,97 @@ func (r *Runner) RunOnce(ctx context.Context, ref Ref, sha string) bool {
 		return false
 	}
 	defer os.RemoveAll(dir)
-	passed, _ := r.runCommit(ctx, ref, sha, dir)
+	passed, _ := r.runCommit(ctx, ref, sha, dir, false) // ad-hoc run: read the golden cache, never prime/write it
 	return passed
 }
 
-// runCommit reads the repo's .poll-ci.yml and runs every check, posting commit
-// statuses throughout. passed reports whether all checks passed; completed
-// reports whether the run reached a terminal result (as opposed to being cut
-// short by cancellation) — a completed run's results stand even if a late
-// cancel raced in after the last check finished.
-func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) (passed, completed bool) {
+// unit is one gate step (a check or the scan): the commit-status context it
+// resolves, its CPU cost, and the work itself. run reports (passed, one-line
+// description); it must observe ctx cancellation and return promptly.
+type unit struct {
+	sctx string
+	cost float64
+	run  func(ctx context.Context) (ok bool, desc string)
+}
+
+// runUnits runs the units with bounded concurrency: a unit starts only while
+// fewer than maxCount are running AND the running set's summed cost (each cost
+// clamped to budget so a heavy unit can still run alone) stays within budget — so
+// the sum of running --cpus caps never exceeds the budget (no oversubscription)
+// while light units pack densely. As each unit finishes it posts its own terminal
+// status; a unit cut short by cancellation posts nothing (its completed[i] stays
+// false) and the caller terminalizes it. Returns the failure count and, per unit,
+// whether it produced a real result.
+func (r *Runner) runUnits(ctx context.Context, ref Ref, sha string, units []unit, maxCount int, budget float64) (failed int, completed []bool) {
+	completed = make([]bool, len(units))
+	if maxCount < 1 {
+		maxCount = 1
+	}
+	var (
+		mu      sync.Mutex
+		cond    = sync.NewCond(&mu)
+		running int
+		used    float64
+		wg      sync.WaitGroup
+	)
+	for i := range units {
+		u := units[i]
+		cost := u.cost
+		if cost > budget {
+			cost = budget // clamp so an over-budget unit still runs (alone)
+		}
+		mu.Lock()
+		for running > 0 && (running >= maxCount || used+cost > budget) {
+			cond.Wait()
+		}
+		if ctx.Err() != nil { // cancelled — stop launching new units
+			mu.Unlock()
+			break
+		}
+		running++
+		used += cost
+		mu.Unlock()
+
+		wg.Add(1)
+		go func(i int, u unit, cost float64) {
+			defer wg.Done()
+			ok, desc := u.run(ctx)
+			mu.Lock()
+			running--
+			used -= cost
+			cond.Signal()
+			mu.Unlock()
+			if ctx.Err() != nil {
+				return // cancelled mid-unit — the caller terminalizes this context
+			}
+			state := StateSuccess
+			if !ok {
+				state = StateFailure
+				mu.Lock()
+				failed++
+				mu.Unlock()
+			}
+			log.Printf("[%s] %s %s → %s (%s)", ref, short(sha), u.sctx, state, desc)
+			r.setStatus(ctx, ref, sha, state, u.sctx, desc)
+			mu.Lock()
+			completed[i] = true
+			mu.Unlock()
+		}(i, u, cost)
+	}
+	wg.Wait()
+	return failed, completed
+}
+
+// runCommit reads the repo's .poll-ci.yml and runs every check (plus the optional
+// trivy scan), posting commit statuses throughout. With CHECK_CONCURRENCY > 1 the
+// gate steps run concurrently, bounded by a count cap and CHECK_CPU_BUDGET (see
+// runUnits). passed reports whether all checks passed; completed reports whether
+// the run reached a terminal result (vs being cut short by cancellation) — a
+// completed run's results stand even if a late cancel raced in after the last
+// unit finished. canPrime is true only for watched-branch runs, which may
+// (re)build the golden dependency cache; PR and --once runs read it but never
+// write it.
+func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string, canPrime bool) (passed, completed bool) {
 	rc, err := r.readRepoConfig(dir)
 	if err != nil {
 		// No usable config: report one error status so the commit isn't silently ignored.
@@ -399,6 +484,15 @@ func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) (passe
 		image = r.cfg.DefaultImage
 	}
 	r.ensureImage(ctx, image)
+	var scanImage string
+	if rc.Scan != nil {
+		scanImage = rc.Scan.Image
+		r.ensureImage(ctx, scanImage) // pull up front so it never counts against a unit timeout
+	}
+
+	// Bring the clean golden dependency cache up to date and get the host dirs to
+	// copy into each check container (best-effort — never blocks the run).
+	mounts := r.prepareCache(ctx, ref, image, dir, r.resolveCache(rc, dir), canPrime)
 
 	// Total gate steps = checks + the optional built-in trivy scan.
 	total := len(rc.Checks)
@@ -415,66 +509,59 @@ func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) (passe
 		r.setStatus(ctx, ref, sha, StatePending, "ci/trivy", "queued")
 	}
 
-	// Run each check. `done` is the count of fully-resolved checks, so on a
-	// short-circuit rc.Checks[done:] is exactly the set still to terminalize.
-	failed, done := 0, 0
-	for ; done < len(rc.Checks); done++ {
-		if ctx.Err() != nil {
-			break // cancelled before this check started
-		}
-		ck := rc.Checks[done]
-		ok, desc := r.runCheck(ctx, image, dir, ck)
-		if ctx.Err() != nil {
-			break // cancelled mid-check — discard the "cancelled" result; resolve it below
-		}
-		state := StateSuccess
-		if !ok {
-			state, failed = StateFailure, failed+1
-		}
-		log.Printf("[%s] %s ci/%s → %s (%s)", ref, short(sha), ck.Name, state, desc)
-		r.setStatus(ctx, ref, sha, state, "ci/"+ck.Name, desc)
+	// Buffer per-step output into labeled blocks only when steps can actually
+	// overlap; a single serial step keeps today's raw live streaming.
+	parallel := r.cfg.CheckConcurrency > 1 && total > 1
+
+	// Build the unit list: each check, then the optional scan. A unit's cost is
+	// both its scheduler admission weight and its --cpus cap (see runUnits).
+	units := make([]unit, 0, total)
+	for _, ck := range rc.Checks {
+		ck := ck
+		units = append(units, unit{
+			sctx: "ci/" + ck.Name,
+			cost: ck.cpuCost(),
+			run: func(c context.Context) (bool, string) {
+				return r.runCheck(c, image, dir, ck, mounts, parallel)
+			},
+		})
+	}
+	if rc.Scan != nil {
+		sc := rc.Scan
+		units = append(units, unit{
+			sctx: "ci/trivy",
+			cost: 1,
+			run: func(c context.Context) (bool, string) {
+				return r.runScan(c, scanImage, dir, sc, parallel)
+			},
+		})
 	}
 
-	// Built-in trivy scan of the sources (opt-in via scan:). A finding fails the
-	// gate just like any check, so a promote: target won't advance.
-	scanDone := false
-	if done == len(rc.Checks) && rc.Scan != nil && ctx.Err() == nil {
-		scanImage := rc.Scan.Image
-		r.ensureImage(ctx, scanImage)
-		ok, desc := r.runScan(ctx, scanImage, dir, rc.Scan)
-		if ctx.Err() == nil { // cancelled mid-scan — discard the "cancelled" result; resolve it below
-			state := StateSuccess
-			if !ok {
-				state, failed = StateFailure, failed+1
-			}
-			log.Printf("[%s] %s ci/trivy → %s (%s)", ref, short(sha), state, desc)
-			r.setStatus(ctx, ref, sha, state, "ci/trivy", desc)
-			scanDone = true
+	failed, done := r.runUnits(ctx, ref, sha, units, r.cfg.CheckConcurrency, r.cfg.CheckCPUBudget)
+
+	allCompleted := true
+	for _, c := range done {
+		if !c {
+			allCompleted = false
+			break
 		}
 	}
-
-	// A run that resolved every step is complete: its results stand even if a
-	// cancellation raced in between the last step and here.
-	completed = done == len(rc.Checks) && (rc.Scan == nil || scanDone)
 
 	// Short-circuited by a newer commit before finishing: terminalize every
-	// context we did not resolve — the in-flight + not-yet-started checks, and
-	// the scan if unreached — so none lingers `pending` on this superseded SHA.
-	// Completed checks keep their real results; processBranchOnce resolves the
-	// matching `ci` rollup. (These posts land despite the now-cancelled ctx
-	// because setStatus detaches it.)
+	// context runUnits left unresolved so none lingers `pending` on this
+	// superseded SHA. Completed units keep their real results; processBranchOnce
+	// resolves the matching `ci` rollup. (These posts land despite the now-
+	// cancelled ctx because setStatus detaches it.)
 	var se *supersededError
-	if !completed && errors.As(context.Cause(ctx), &se) {
-		for _, ck := range rc.Checks[done:] {
-			r.setStatus(ctx, ref, sha, StateError, "ci/"+ck.Name, se.Error())
-		}
-		if rc.Scan != nil && !scanDone {
-			r.setStatus(ctx, ref, sha, StateError, "ci/trivy", se.Error())
+	if !allCompleted && errors.As(context.Cause(ctx), &se) {
+		for i, u := range units {
+			if !done[i] {
+				r.setStatus(ctx, ref, sha, StateError, u.sctx, se.Error())
+			}
 		}
 		return false, false
 	}
-
-	if !completed && ctx.Err() != nil {
+	if !allCompleted && ctx.Err() != nil {
 		return false, false // engine shutdown — leave unresolved contexts pending; the commit re-runs on restart
 	}
 
@@ -490,7 +577,14 @@ func (r *Runner) runCommit(ctx context.Context, ref Ref, sha, dir string) (passe
 // checkout and returns (passed, one-line description). It mirrors runCheck but
 // uses trivy's own entrypoint with argv passing (no shell) and mounts a named
 // volume as the trivy cache so the vulnerability DB persists between runs.
-func (r *Runner) runScan(ctx context.Context, image, dir string, sc *Scan) (bool, string) {
+func (r *Runner) runScan(ctx context.Context, image, dir string, sc *Scan, parallel bool) (ok bool, desc string) {
+	var live io.Writer = os.Stdout
+	if parallel {
+		blk := &blockBuffer{max: 2 << 20}
+		live = blk
+		defer func() { blk.flush(os.Stdout, "ci/trivy — "+desc) }()
+	}
+
 	timeout := r.cfg.DefaultTimeout
 	if sc.Timeout > 0 {
 		timeout = time.Duration(sc.Timeout) * time.Second
@@ -515,7 +609,7 @@ func (r *Runner) runScan(ctx context.Context, image, dir string, sc *Scan) (bool
 	}
 	args = append(args, target)
 
-	cid, err := r.dockerCreateScan(cctx, image, sc.CacheVolume, args)
+	cid, err := r.dockerCreateScan(cctx, image, sc.CacheVolume, args, r.cfg.CheckCPUs, r.cfg.CheckMemory)
 	if err != nil {
 		return false, "scan container create failed: " + oneLine(scrub(err.Error(), r.secrets...))
 	}
@@ -525,7 +619,7 @@ func (r *Runner) runScan(ctx context.Context, image, dir string, sc *Scan) (bool
 		return false, "copy sources failed: " + oneLine(err.Error())
 	}
 
-	_, _, startErr := r.dockerStart(cctx, cid) // streams trivy's report to the logs; blocks until exit
+	_, _, startErr := r.dockerStart(cctx, cid, live) // streams trivy's report to the logs; blocks until exit
 	if cctx.Err() == context.DeadlineExceeded {
 		return false, fmt.Sprintf("timed out after %s", timeout)
 	}
@@ -603,8 +697,18 @@ func (r *Runner) maybePromote(ctx context.Context, ref Ref, sha, dir string) {
 }
 
 // runCheck runs one check in a fresh container built from `image`, with the
-// checkout copied to /repo. Returns (passed, one-line description).
-func (r *Runner) runCheck(ctx context.Context, image, dir string, ck Check) (bool, string) {
+// checkout copied to /repo and any golden caches copied in. Returns (passed,
+// one-line description). When parallel, the check's live output is buffered and
+// flushed as one labeled block so concurrent checks don't interleave; a serial
+// check streams raw to stdout as before.
+func (r *Runner) runCheck(ctx context.Context, image, dir string, ck Check, mounts []cacheMount, parallel bool) (ok bool, desc string) {
+	var live io.Writer = os.Stdout
+	if parallel {
+		blk := &blockBuffer{max: 2 << 20}
+		live = blk
+		defer func() { blk.flush(os.Stdout, "ci/"+ck.Name+" — "+desc) }()
+	}
+
 	timeout := r.cfg.DefaultTimeout
 	if ck.Timeout > 0 {
 		timeout = time.Duration(ck.Timeout) * time.Second
@@ -613,7 +717,7 @@ func (r *Runner) runCheck(ctx context.Context, image, dir string, ck Check) (boo
 	defer cancel()
 	start := time.Now()
 
-	cid, err := r.dockerCreate(cctx, image, ck.Run)
+	cid, err := r.dockerCreate(cctx, image, ck.Run, r.effectiveCPUs(ck), r.effectiveMemory(ck))
 	if err != nil {
 		return false, "container create failed: " + oneLine(scrub(err.Error(), r.secrets...))
 	}
@@ -622,8 +726,15 @@ func (r *Runner) runCheck(ctx context.Context, image, dir string, ck Check) (boo
 	if err := r.dockerCopyIn(cctx, dir, cid); err != nil {
 		return false, "copy sources failed: " + oneLine(err.Error())
 	}
+	// Each check gets its own private copy of the clean golden cache — never
+	// written back, so it can't be poisoned. Best-effort: a failure runs colder.
+	for _, m := range mounts {
+		if err := r.dockerCopyDirIn(cctx, m.hostDir, cid, m.containerPath); err != nil {
+			log.Printf("cache: copy %s into %s failed (continuing): %v", m.containerPath, ck.Name, oneLine(err.Error()))
+		}
+	}
 
-	stdout, stderr, startErr := r.dockerStart(cctx, cid)
+	stdout, stderr, startErr := r.dockerStart(cctx, cid, live)
 	if cctx.Err() == context.DeadlineExceeded {
 		return false, fmt.Sprintf("timed out after %s", timeout)
 	}
@@ -753,10 +864,11 @@ func needsPull(present bool, last time.Time, refresh time.Duration) bool {
 	return time.Since(last) >= refresh
 }
 
-// dockerCreate creates (but does not start) a container that runs the check.
-func (r *Runner) dockerCreate(ctx context.Context, image, run string) (string, error) {
+// dockerCreate creates (but does not start) a container that runs the check,
+// with the given per-container cpus/memory caps.
+func (r *Runner) dockerCreate(ctx context.Context, image, run, cpus, memory string) (string, error) {
 	args := append([]string{"create"}, r.labelArgs()...)
-	args = append(args, r.limitArgs()...)
+	args = append(args, r.limitArgs(cpus, memory)...)
 	args = append(args, "-w", "/repo", image, "sh", "-ec", run)
 	out, errb, err := r.dockerRun(ctx, args...)
 	if err != nil {
@@ -771,21 +883,43 @@ func (r *Runner) labelArgs() []string {
 	return []string{"--label", "poll-ci", "--label", "poll-ci.instance=" + r.instance}
 }
 
-// limitArgs returns the optional resource-limit flags for check/scan
-// containers, so a runaway check can't starve the CI host. Empty (the default)
-// means no limit — today's behavior.
-func (r *Runner) limitArgs() []string {
+// limitArgs returns the resource-limit flags for a check/scan container: the
+// resolved per-container cpus/memory (from per-check hints or the CHECK_*
+// globals) plus the global CHECK_PIDS. Empty values mean no limit.
+func (r *Runner) limitArgs(cpus, memory string) []string {
 	var args []string
-	if v := r.cfg.CheckMemory; v != "" {
-		args = append(args, "--memory", v)
+	if memory != "" {
+		args = append(args, "--memory", memory)
 	}
-	if v := r.cfg.CheckCPUs; v != "" {
-		args = append(args, "--cpus", v)
+	if cpus != "" {
+		args = append(args, "--cpus", cpus)
 	}
 	if v := r.cfg.CheckPids; v != "" {
 		args = append(args, "--pids-limit", v)
 	}
 	return args
+}
+
+// effectiveCPUs is a check's docker --cpus cap: its cpus: hint, else the global
+// CHECK_CPUS, else unset. By default a parallel check is NOT pinned to a single
+// core — CHECK_CONCURRENCY bounds how many run at once and the OS shares the host
+// CPUs, so a CPU-heavy check (go test, a bundler) still uses several cores. A
+// cpus: hint (which also becomes the check's scheduler cost) is how you cap a
+// specific check and reserve its slice of CHECK_CPU_BUDGET.
+func (r *Runner) effectiveCPUs(ck Check) string {
+	if ck.CPUs != "" {
+		return ck.CPUs
+	}
+	return r.cfg.CheckCPUs
+}
+
+// effectiveMemory is a check's docker --memory value: its memory: hint, else the
+// global CHECK_MEMORY.
+func (r *Runner) effectiveMemory(ck Check) string {
+	if ck.Memory != "" {
+		return ck.Memory
+	}
+	return r.cfg.CheckMemory
 }
 
 // sweepOrphans removes containers and checkout dirs left behind by a previous
@@ -819,9 +953,9 @@ func (r *Runner) sweepOrphans(ctx context.Context) {
 // image's own entrypoint and passes trivyArgs as separate argv elements (so no
 // shell parses user-supplied scanners/severity/path). A named volume is mounted
 // as the trivy cache to persist the vulnerability DB across runs.
-func (r *Runner) dockerCreateScan(ctx context.Context, image, cacheVolume string, trivyArgs []string) (string, error) {
+func (r *Runner) dockerCreateScan(ctx context.Context, image, cacheVolume string, trivyArgs []string, cpus, memory string) (string, error) {
 	args := append([]string{"create"}, r.labelArgs()...)
-	args = append(args, r.limitArgs()...)
+	args = append(args, r.limitArgs(cpus, memory)...)
 	args = append(args, "-w", "/repo", "-v", cacheVolume+":/trivy-cache", image)
 	args = append(args, trivyArgs...)
 	out, errb, err := r.dockerRun(ctx, args...)
@@ -860,12 +994,16 @@ func (r *Runner) dockerCopyIn(ctx context.Context, dir, cid string) error {
 // while keeping the tail of each stream separately for the status description.
 // startErr is the CLI's own error: a non-zero check exit also surfaces here, so
 // it is only meaningful when the container never left the created state.
-func (r *Runner) dockerStart(ctx context.Context, cid string) (stdout, stderr string, startErr error) {
+// live is where the container's output is streamed: os.Stdout for a serial step
+// (raw, as before) or a blockBuffer for a parallel step (flushed as one labeled
+// block by the caller). The 64 KiB tails are kept separately for the status
+// description regardless.
+func (r *Runner) dockerStart(ctx context.Context, cid string, live io.Writer) (stdout, stderr string, startErr error) {
 	so := &tailBuffer{max: 64 << 10}
 	se := &tailBuffer{max: 64 << 10}
 	cmd := exec.CommandContext(ctx, r.cfg.DockerBin, "start", "-a", cid)
-	cmd.Stdout = io.MultiWriter(so, os.Stdout)
-	cmd.Stderr = io.MultiWriter(se, os.Stdout)
+	cmd.Stdout = io.MultiWriter(so, live)
+	cmd.Stderr = io.MultiWriter(se, live)
 	startErr = cmd.Run() // the real outcome comes from dockerOutcome
 	return so.String(), se.String(), startErr
 }
