@@ -622,8 +622,10 @@ the bundled unit + installer in [`deploy/`](deploy):
 
 ```bash
 # from a checkout on the host:
-sudo deploy/install.sh             # install + enable  (--build to build the
-                                   # image first, --start to start right away)
+sudo deploy/install.sh             # install + enable  (--build builds the image
+                                   # first; --start starts now; --autoupdate adds the
+                                   # daily image self-update timer; --heartbeat adds
+                                   # the dead-man's-switch)
 sudoedit /etc/poll-ci/poll-ci.env  # set GITHUB_TOKEN  (this file is 0600)
 sudoedit /etc/poll-ci/repos.yml    # the repo(s) to watch
 sudo systemctl start poll-ci
@@ -694,19 +696,40 @@ docker compose pull && docker compose up -d   # pull the newest image and recrea
 
 State on the volume is preserved, so already-tested commits aren't re-run.
 
-**Automatic updates (optional).** The bundled compose file ships a profile that
-keeps poll-ci on the latest image for you, via [watchtower]:
+**Automatic updates (optional).** Two paths, depending on how you deployed:
 
-```bash
-docker compose --profile autoupdate up -d
-```
+- **systemd (the `install.sh` way).** Add the bundled self-update timer:
 
-Watchtower polls the registry hourly and recreates the poll-ci container in place
-when its image digest changes (scoped by label to only touch poll-ci). A new
-image landing mid-check is safe: poll-ci catches SIGTERM, cancels the in-flight
-check, and re-runs that commit after the restart. If the branch moved on while
-it was down, the interrupted commit's statuses are resolved at startup
-(`interrupted by restart`) instead of lingering `pending`.
+  ```bash
+  sudo deploy/install.sh --autoupdate     # or: sudo systemctl enable --now poll-ci-update.timer
+  ```
+
+  A daily timer (with up to an hour of jitter) pulls `:latest` and — **only if the
+  image digest changed** — restarts `poll-ci.service`, whose `ExecStartPre` re-pulls
+  and recreates the container. No churn on days without a release. To apply a new
+  image immediately instead of waiting for the timer:
+
+  ```bash
+  sudo systemctl start poll-ci-update.service
+  ```
+
+  This is the right fit for the systemd deployment — watchtower would fight
+  systemd over the container lifecycle, so the timer drives the unit instead.
+
+- **docker compose.** The bundled compose file ships a profile that does the same
+  via [watchtower]:
+
+  ```bash
+  docker compose --profile autoupdate up -d
+  ```
+
+  Watchtower polls the registry hourly and recreates poll-ci in place when its
+  image digest changes (scoped by label to only touch poll-ci).
+
+Either way, a new image landing mid-check is safe: poll-ci catches SIGTERM,
+cancels the in-flight check, and re-runs that commit after the restart. If the
+branch moved on while it was down, the interrupted commit's statuses are resolved
+at startup (`interrupted by restart`) instead of lingering `pending`.
 
 [watchtower]: https://containrrr.dev/watchtower/
 

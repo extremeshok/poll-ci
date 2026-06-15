@@ -6,6 +6,7 @@
 #   sudo deploy/install.sh --build    # also build the image from this checkout
 #   sudo deploy/install.sh --start    # also (re)start once config is in place
 #   sudo deploy/install.sh --heartbeat  # also install the dead-man's-switch timer
+#   sudo deploy/install.sh --autoupdate # also install the daily image self-update timer
 #
 # Creates (config files only if missing — re-running never overwrites secrets):
 #   /etc/poll-ci/poll-ci.env            0600, holds GITHUB_TOKEN
@@ -15,6 +16,9 @@
 #   /usr/local/bin/poll-ci-heartbeat                       the monitor script
 #   /etc/poll-ci/heartbeat.env                             0640, HEARTBEAT_* config
 #   /etc/systemd/system/poll-ci-heartbeat.{service,timer}  the periodic check
+# With --autoupdate, also:
+#   /usr/local/bin/poll-ci-autoupdate                      the image-update script
+#   /etc/systemd/system/poll-ci-update.{service,timer}     the daily upgrade check
 #
 # Override the image/name:  POLL_CI_IMAGE=… POLL_CI_NAME=… sudo deploy/install.sh
 set -euo pipefail
@@ -29,12 +33,14 @@ UNIT_SRC="${SRC_DIR}/systemd/poll-ci.service"
 DO_BUILD=false
 DO_START=false
 DO_HEARTBEAT=false
+DO_AUTOUPDATE=false
 for a in "$@"; do
   case "$a" in
     --build) DO_BUILD=true ;;
     --start) DO_START=true ;;
     --heartbeat) DO_HEARTBEAT=true ;;
-    -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --autoupdate) DO_AUTOUPDATE=true ;;
+    -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $a" >&2; exit 2 ;;
   esac
 done
@@ -121,12 +127,22 @@ HENV
   fi
 fi
 
+if [ "$DO_AUTOUPDATE" = true ]; then
+  install -m 0755 "${SRC_DIR}/autoupdate.sh" /usr/local/bin/poll-ci-autoupdate
+  install -m 0644 "${SRC_DIR}/systemd/poll-ci-update.service" /etc/systemd/system/poll-ci-update.service
+  install -m 0644 "${SRC_DIR}/systemd/poll-ci-update.timer"   /etc/systemd/system/poll-ci-update.timer
+fi
+
 systemctl daemon-reload
 systemctl enable poll-ci.service >/dev/null
 echo ">> installed + enabled poll-ci.service (image ${IMAGE})"
 if [ "$DO_HEARTBEAT" = true ]; then
   systemctl enable --now poll-ci-heartbeat.timer >/dev/null
   echo ">> installed + enabled poll-ci-heartbeat.timer (edit ${CONF_DIR}/heartbeat.env, set HEARTBEAT_ALERT_URL)"
+fi
+if [ "$DO_AUTOUPDATE" = true ]; then
+  systemctl enable --now poll-ci-update.timer >/dev/null
+  echo ">> installed + enabled poll-ci-update.timer (daily image self-update; apply now with: systemctl start poll-ci-update.service)"
 fi
 
 if [ "$DO_START" = true ]; then
