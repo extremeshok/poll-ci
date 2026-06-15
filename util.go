@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // writeTar streams `src`'s contents into w as a tar, each entry under `prefix/`.
@@ -117,6 +118,92 @@ func scrub(s string, secrets ...string) string {
 		}
 	}
 	return s
+}
+
+// cacheKey is a stable, filesystem-safe token for a repo+branch's golden cache,
+// namespacing it so two repos (or two branches) never share — or poison — a
+// cache. Branch names can contain slashes and other awkward characters, so the
+// whole key is hashed rather than used as a path component.
+func cacheKey(repo, branch string) string {
+	sum := sha256.Sum256([]byte(repo + "\x00" + branch))
+	return hex.EncodeToString(sum[:8])
+}
+
+// cachePathDir is the host directory holding the golden copy of one container
+// cache path, under a repo+branch's cache root.
+func cachePathDir(root, containerPath string) string {
+	sum := sha256.Sum256([]byte(containerPath))
+	return filepath.Join(root, hex.EncodeToString(sum[:8]))
+}
+
+// lockfileHash hashes the contents of the given repo-relative files (those that
+// exist) into a stable token, so a golden cache can be re-primed exactly when
+// dependencies change. Returns "" when none of the files exist.
+func lockfileHash(dir string, files []string) string {
+	h := sha256.New()
+	any := false
+	for _, f := range files {
+		data, err := os.ReadFile(filepath.Join(dir, f))
+		if err != nil {
+			continue
+		}
+		any = true
+		h.Write([]byte(f))
+		h.Write([]byte{0})
+		h.Write(data)
+		h.Write([]byte{0})
+	}
+	if !any {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// blockBuffer captures one check's output (bounded) so parallel checks can each
+// be flushed as a single labeled block instead of interleaving their streams
+// live. Past max bytes it keeps the tail (where failures print) and notes the
+// truncation. Safe for concurrent writes (docker stdout+stderr stream into it
+// from separate goroutines).
+type blockBuffer struct {
+	mu        sync.Mutex
+	max       int
+	buf       []byte
+	truncated bool
+	flushed   bool
+}
+
+func (b *blockBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf = append(b.buf, p...)
+	if len(b.buf) > b.max {
+		b.buf = b.buf[len(b.buf)-b.max:]
+		b.truncated = true
+	}
+	return len(p), nil
+}
+
+// flush writes the captured output to w as one labeled block (a `===== label
+// =====` header, a truncation note if it overflowed, then the body). It is a
+// no-op after the first call, so a defer-flush on cancellation and an explicit
+// flush on completion can both fire without double-printing.
+func (b *blockBuffer) flush(w io.Writer, label string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.flushed {
+		return
+	}
+	b.flushed = true
+	var sb strings.Builder
+	sb.WriteString("===== " + label + " =====\n")
+	if b.truncated {
+		sb.WriteString("…(output head truncated; see docker logs for the full log)\n")
+	}
+	sb.Write(b.buf)
+	if n := len(b.buf); n > 0 && b.buf[n-1] != '\n' {
+		sb.WriteByte('\n')
+	}
+	io.WriteString(w, sb.String())
 }
 
 // truncate shortens s to at most n runes (GitHub counts characters), adding an
