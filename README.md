@@ -253,11 +253,23 @@ promote:                  # optional: fast-forward a branch on green (see below)
   description is the last line of output (stderr preferred) — e.g.
   `exit 1: FAIL: expected 4 but got 5`. A check that exceeds its `timeout` is a
   failure (`timed out after 15m0s`) and its container is killed.
-- Checks run **sequentially, each in its own fresh container** built from
-  `image`, with the commit's files at `/repo` (the working directory). `.git`
-  is included too, but it's a **shallow, depth-1 clone** — full history and tags
-  aren't fetched, so `git describe --tags` and `git log` beyond the tip won't
-  work.
+- Checks run **in parallel by default** (up to `CHECK_CONCURRENCY`, default: the
+  host CPU count), **each in its own fresh container** built from `image`, with the commit's files
+  at `/repo` (the working directory). Set `CHECK_CONCURRENCY=1` to run them one at
+  a time. `.git` is included too, but it's a **shallow, depth-1 clone** — full
+  history and tags aren't fetched, so `git describe --tags` and `git log` beyond
+  the tip won't work.
+- **Concurrency and per-check resources.** By default a commit's checks run up to
+  `CHECK_CONCURRENCY` (default: the host CPU count) at a time and **share the host
+  CPUs** — checks are *not* pinned to one core, so a `go test` or a bundler still
+  uses several.
+  A check may *optionally* set `cpus:` and `memory:` (docker `--cpus`/`--memory`)
+  to cap itself; `cpus:` is then also its **scheduler weight**, and poll-ci admits
+  checks while their summed `cpus` stays within `CHECK_CPU_BUDGET` (default: the
+  host CPU count) — so a heavy check (`cpus: 4`) reserves its slice and light ones
+  pack densely. (Quote the values, e.g. `cpus: "2"`.) Under parallelism each
+  check's output is buffered and printed as one labeled block; a single serial
+  check (`CHECK_CONCURRENCY=1`) streams live as before.
 - **There is no shared workspace between checks** — this is not a pipeline. A
   check that needs dependencies must install them itself. Combine setup with the
   check rather than splitting them:
@@ -317,6 +329,51 @@ scan:
 - Like checks, the scan **needs network** (first run downloads the DB) and runs
   beside the Docker socket — so, as with checks, only point poll-ci at repos you
   trust.
+
+### Caching dependencies (`cache:`)
+
+To avoid re-downloading dependencies every run, poll-ci can keep a **clean
+"golden" cache** per repo+branch and **copy it into each check container**. It is
+**opt-in** — enable it with `CACHE=true` (and tune per repo with `cache:`).
+
+> **When caching helps — and when it doesn't.** Because poll-ci is mount-free, the
+> golden cache is **copied into every check container** (the price of needing
+> nothing mounted but the Docker socket). That copy is only worth it when your
+> checks are **download-dominated**. For **compute-bound** checks — `go test`,
+> coverage, a webpack/vite build — the wall-clock is the compilation, which
+> caching can't shorten, and at high `CHECK_CONCURRENCY` the concurrent copy-in
+> can even add I/O contention. Measure your repo before enabling it; **parallelism
+> (on by default) is the bigger, universal win.** Leave `CACHE` off unless a check
+> spends real time on `npm ci` / `go mod download` / `pip install` over the
+> network.
+
+How it stays clean (and unpoisonable):
+
+- The golden cache is built by a **prime command** run in an *isolated* container,
+  then copied into each check as a **private copy**. **Checks never write the
+  golden back**, so a run — or a PR — can't poison it.
+- It's **auto-detected** from ecosystem marker files: `go.mod` → `/go/pkg/mod` +
+  `/root/.cache/go-build`, primed with `go mod download`; npm / yarn / pnpm / pip
+  / poetry / cargo are detected similarly. Override per repo:
+
+  ```yaml
+  cache:
+    paths: [/go/pkg/mod, /root/.cache/go-build]   # container dirs to persist
+    prime: go mod download                        # run in a clean container to populate them
+  ```
+
+- The golden is **re-primed only on watched-branch runs**, and only when the
+  lockfiles change (their content hash differs) or `CACHE_REFRESH_HOURS`
+  (default 24) lapses. **PR and `--once` runs read it but never prime/write it.**
+- It's a **speed optimization only** — a check must still pass from a cold cache.
+  The golden lives under `WORK_DIR/cache/`; delete it to reset (it grows over
+  time). Priming is best-effort: if the prime command fails, the run just
+  proceeds cold.
+
+> **Caveat — caching + parallel checks:** content-addressed caches (the Go
+> build/module cache) tolerate concurrent checks; others (e.g. `node_modules`)
+> may not. Prefer caching the *download* cache (`~/.npm`, `~/.cache/pip`), or keep
+> such checks serial.
 
 ### Promoting a deploy branch on green (`promote:`)
 
@@ -442,8 +499,12 @@ All configuration is environment variables.
 | `SHORT_CIRCUIT`   | `true`                   | Abort a run when a newer commit lands mid-run and jump to it ([why](#short-circuiting-superseded-runs)) |
 | `MARK_SKIPPED`    | `false`                  | Post a terminal `ci` status on never-tested intermediate commits ([details](#marking-skipped-commits-mark_skipped)) |
 | `CONCURRENCY`     | `1`                      | Refs swept in parallel — useful with a multi-repo `REPOS_FILE` |
-| `CHECK_MEMORY`    | *(unlimited)*            | `docker --memory` for check/scan containers, e.g. `2g`        |
-| `CHECK_CPUS`      | *(unlimited)*            | `docker --cpus` for check/scan containers, e.g. `2`           |
+| `CHECK_CONCURRENCY` | *(host CPU count)*     | A commit's checks run in parallel up to this many; `1` = serial (old behavior) |
+| `CHECK_CPU_BUDGET` | *(host CPU count)*      | Max summed per-check `cpus` admitted at once across a commit ([details](#the-poll-ciyml-file)) |
+| `CACHE`           | `false`                  | **Opt-in** clean dependency-cache copy-in; `CACHE=true` enables it ([when it helps](#caching-dependencies-cache)) |
+| `CACHE_REFRESH_HOURS` | `24`                 | Re-prime the golden cache at least this often (`0` = only when missing/stale) |
+| `CHECK_MEMORY`    | *(unlimited)*            | Global `docker --memory` for check/scan containers, e.g. `2g` (per-check `memory:` overrides) |
+| `CHECK_CPUS`      | *(serial: unlimited)*    | Global `docker --cpus` in **serial** mode; in parallel each check is capped to its `cpus` cost |
 | `CHECK_PIDS`      | *(unlimited)*            | `docker --pids-limit` for check/scan containers, e.g. `4096`  |
 | `IMAGE_REFRESH_HOURS` | `0` (never)          | Re-pull present check images this often, so `:latest` tags don't freeze at first pull |
 | `GITHUB_API`      | `https://api.github.com` | API base — set for GitHub Enterprise Server                   |
@@ -531,7 +592,7 @@ GitHub Container Registry:
 
 ```
 ghcr.io/extremeshok/poll-ci:latest    # newest release
-ghcr.io/extremeshok/poll-ci:v1.4.0    # pin to a specific version (recommended for prod)
+ghcr.io/extremeshok/poll-ci:v1.5.0    # pin to a specific version (recommended for prod)
 ```
 
 Prefer building your own? `docker build -t poll-ci .` from a checkout — the
@@ -591,7 +652,7 @@ from the [releases page](https://github.com/extremeshok/poll-ci/releases), or
 ```bash
 # Prebuilt (Linux x86-64; see releases for other OS/arch + newer versions).
 # The tarball also contains README.md + LICENSE.
-curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.4.0/poll-ci_v1.4.0_linux_amd64.tar.gz | tar -xz
+curl -fsSL https://github.com/extremeshok/poll-ci/releases/download/v1.5.0/poll-ci_v1.5.0_linux_amd64.tar.gz | tar -xz
 sudo install poll-ci /usr/local/bin/
 
 # …or from source:
@@ -827,11 +888,15 @@ Stated plainly, so there are no surprises:
 - **Tests HEAD only.** Each poll tests the branch tip; intermediate commits of a
   multi-commit push aren't individually tested (`MARK_SKIPPED` at least makes
   that visible on each skipped commit).
-- **Sequential checks.** A repo's checks run one at a time — per-check
-  `timeout` keeps a stuck check from blocking forever. Repos are also swept
-  one at a time by default; set `CONCURRENCY=N` to sweep several in parallel.
-- **No caching.** Every run starts clean (Docker *image* layers are still cached
-  by the host daemon). Warm dependencies? Bake them into a custom `image:`.
+- **Parallel checks (default).** A repo's checks run up to `CHECK_CONCURRENCY`
+  (default: the host CPU count) at a time, bounded by `CHECK_CPU_BUDGET`;
+  `CHECK_CONCURRENCY=1` restores one-at-a-time. Repos are still swept one at a time
+  by default — set `CONCURRENCY=N` to sweep several in parallel. Under parallelism
+  each check's output is buffered into a labeled block (serial keeps live streaming).
+- **Dependency caching (opt-in).** With `CACHE=true`, a clean, auto-detected
+  dependency cache is copied into each check (`cache:` customizes). Off by default
+  because the copy-in only pays off for download-heavy checks ([details](#caching-dependencies-cache)).
+  Docker *image* layers are cached by the host daemon regardless.
 - **One image per repo**, shared by all its checks.
 - **No secrets management, no artifacts, no logs UI.** Output lives in
   `docker logs`; the status description is a one-line summary.
@@ -859,10 +924,13 @@ Yes. The tested-SHA set is persisted to the state volume and `--restart always`
 brings the container back after a reboot. Already-tested commits aren't re-run.
 
 **Can I run checks in parallel / cache dependencies?**
-No — both are intentionally left out to keep the tool tiny and predictable. See
-[Limitations](#limitations). Bake heavy dependencies into a custom `image:`.
-(*Repos* can be swept in parallel with `CONCURRENCY` — it's the checks within a
-repo that stay sequential.)
+As of v1.5, **parallel checks are on by default** (up to `CHECK_CONCURRENCY`, the
+host CPU count) — `CHECK_CONCURRENCY=1` restores the old one-at-a-time behavior.
+**Dependency caching is opt-in** (`CACHE=true`): it copies a clean, auto-detected
+golden cache into each check, which helps **download-heavy** checks but not
+compute-bound ones — so measure before enabling (see
+[`cache:`](#caching-dependencies-cache)). (*Repos* are still swept one at a time by
+default — `CONCURRENCY=N` sweeps several at once.)
 
 **Does it work with private repos?**
 Yes — give the token access to them.
